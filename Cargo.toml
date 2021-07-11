@@ -1,0 +1,12 @@
+[package]
+name = "rust_8288"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.41"
+tokio = "1.8.0"
+webrtc-ice = "0.2.3"
+webrtc-util = "0.2.3"
