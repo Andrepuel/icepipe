@@ -1,8 +1,11 @@
 #![feature(backtrace)]
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+pub mod ws;
 
-use tokio::{sync::mpsc, time::sleep};
+use std::{future::Future, pin::Pin, sync::Arc};
+
+use anyhow::Context;
+use tokio::{select, sync::mpsc};
 use webrtc_ice::{
     agent::{agent_config::AgentConfig, Agent},
     candidate::Candidate,
@@ -10,80 +13,14 @@ use webrtc_ice::{
 };
 use webrtc_util::Conn;
 
+use crate::ws::Websocket;
+
 type DynResult<T> = Result<T, anyhow::Error>;
 type PinFuture<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send + 'a>>;
 
-trait Signalling {
-    fn send(&self, candidates: Vec<String>) -> PinFuture<'static, ()>;
-    fn recv(&self) -> PinFuture<'static, Vec<String>>;
-    fn clone(&self) -> Box<dyn Signalling>;
-}
-
-#[derive(Clone)]
-pub struct FileSignalling {
-    recv_path: String,
-    send_path: String,
-}
-impl FileSignalling {
-    pub fn dial(base: &str) -> FileSignalling {
-        FileSignalling {
-            recv_path: format!("{}_dial", base),
-            send_path: format!("{}_accept", base),
-        }
-    }
-
-    pub fn accept(base: &str) -> FileSignalling {
-        FileSignalling {
-            recv_path: format!("{}_accept", base),
-            send_path: format!("{}_dial", base),
-        }
-    }
-}
-impl Signalling for FileSignalling {
-    fn send(&self, candidates: Vec<String>) -> PinFuture<'static, ()> {
-        eprintln!("sent {:?}", candidates);
-        let send_path = self.send_path.clone();
-
-        Box::pin(async move {
-            tokio::fs::write(
-                &send_path,
-                candidates
-                    .into_iter()
-                    .fold(String::new(), |a, b| format!("{},{}", a, b)),
-            )
-            .await?;
-
-            Ok(())
-        })
-    }
-
-    fn recv(&self) -> PinFuture<'static, Vec<String>> {
-        let recv_path = self.recv_path.clone();
-
-        Box::pin(async move {
-            let candidates = loop {
-                if !std::path::Path::new(&recv_path).exists() {
-                    eprintln!("{} does not exists, polling", recv_path);
-                    sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-
-                break tokio::fs::read(&recv_path).await?;
-            };
-            std::fs::remove_file(&recv_path)?;
-            let candidates = String::from_utf8(candidates)?;
-
-            Ok(candidates
-                .split(",")
-                .filter(|x| x.len() > 0)
-                .map(|x| x.to_string())
-                .collect())
-        })
-    }
-
-    fn clone(&self) -> Box<dyn Signalling> {
-        Box::new(Clone::clone(self))
-    }
+pub trait Signalling {
+    fn send(&mut self, candidates: String) -> PinFuture<'_, ()>;
+    fn recv(&mut self) -> PinFuture<'_, String>;
 }
 
 #[tokio::main]
@@ -92,37 +29,26 @@ async fn main() -> DynResult<()> {
 }
 
 async fn main2() -> DynResult<()> {
-    let (dialer, signalling, local, remote) = {
-        match std::env::args().nth(1).as_ref().map(|x| x.as_str()) {
-            Some("--dial") => {
-                let signalling: Box<dyn Signalling + Send + Sync> =
-                    Box::new(FileSignalling::dial(&std::env::args().nth(2).unwrap()));
-                (
-                    true,
-                    signalling,
-                    "locallocallocallocal",
-                    "remoteremoteremoteremote",
-                )
-            }
-            Some("--accept") => {
-                let signalling: Box<dyn Signalling + Send + Sync> =
-                    Box::new(FileSignalling::accept(&std::env::args().nth(2).unwrap()));
-                (
-                    false,
-                    signalling,
-                    "remoteremoteremoteremote",
-                    "locallocallocallocal",
-                )
-            }
-            _ => {
-                eprintln!(
-                    "Usage: {} --dial|--acept <base>",
-                    std::env::args().nth(0).unwrap()
-                );
-                panic!();
-            }
-        }
-    };
+    let (mut signalling, dialer) = Websocket::new(
+        url::Url::parse(
+            &std::env::args()
+                .nth(1)
+                .ok_or(anyhow::anyhow!("Missing URL for signalling"))?,
+        )
+        .context("Invalid provided URL")?,
+    )
+    .await?;
+
+    let local;
+    let remote;
+
+    if dialer {
+        local = "locallocallocallocal";
+        remote = "remoteremoteremoteremote";
+    } else {
+        local = "remoteremoteremoteremote";
+        remote = "locallocallocallocal";
+    }
 
     let mut cfg = AgentConfig::default();
     cfg.local_pwd = local.to_string();
@@ -136,52 +62,62 @@ async fn main2() -> DynResult<()> {
 
     let agent = Agent::new(cfg).await?;
 
-    let signalling2 = signalling.clone();
-    let mut candidates = Vec::new();
+    let (candidates_tx_producer, mut candidates_tx) = mpsc::channel(1);
     agent
         .on_candidate(Box::new(move |c| {
-            if c.is_none() {
-                let send = signalling.send(candidates.clone());
-                return Box::pin(async move {
-                    send.await.unwrap();
-
-                    ()
-                });
-            }
-
-            let c = c.unwrap();
-            candidates.push(c.marshal());
-
-            Box::pin(async move {})
+            let send = candidates_tx_producer.clone();
+            Box::pin(async move {
+                if let Some(c) = c {
+                    send.send(c.marshal()).await.unwrap();
+                }
+            })
         }))
         .await;
-    eprintln!("on candidate set");
-
     agent.gather_candidates().await?;
-    eprintln!("gather candidates started");
 
-    eprintln!("Waiting peer candidates");
-    for candidate in signalling2.recv().await? {
-        let candidate: Arc<dyn Candidate + Send + Sync> =
-            Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
-        agent.add_remote_candidate(&candidate).await?;
+    async fn connect(
+        agent: &Agent,
+        dialer: bool,
+        remote: &'static str,
+    ) -> DynResult<Arc<dyn Conn>> {
+        let cancel = mpsc::channel(1);
+        let r: Arc<dyn Conn> = match dialer {
+            true => {
+                agent
+                    .dial(cancel.1, remote.to_string(), remote.to_string())
+                    .await?
+            }
+            false => {
+                agent
+                    .accept(cancel.1, remote.to_string(), remote.to_string())
+                    .await?
+            }
+        };
+        Ok(r)
     }
-    eprintln!("Connecting...");
 
-    let cancel = mpsc::channel(1);
-    let conn: Arc<dyn Conn> = match dialer {
-        true => {
-            agent
-                .dial(cancel.1, remote.to_string(), remote.to_string())
-                .await?
-        }
-        false => {
-            agent
-                .accept(cancel.1, remote.to_string(), remote.to_string())
-                .await?
+    let mut conn_ing = Box::pin(connect(&agent, dialer, remote));
+    let conn = loop {
+        let conn_ing = &mut conn_ing;
+        select! {
+            conn = conn_ing => {
+                break conn?;
+            },
+            candidate = candidates_tx.recv() => {
+                let candidate = candidate.ok_or(anyhow::anyhow!("Candidates channel closed?"))?;
+                eprintln!("TX candidate {}", candidate);
+                signalling.send(candidate).await?;
+            }
+            candidate = signalling.recv() => {
+                let candidate = candidate?;
+                eprintln!("RX candidate {}", candidate);
+                let candidate: Arc<dyn Candidate + Send + Sync> =
+                    Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
+                agent.add_remote_candidate(&candidate).await?;
+            }
         }
     };
-    eprintln!("conn done");
+
     conn.send(b"each").await?;
     let mut buf = Vec::new();
     {
