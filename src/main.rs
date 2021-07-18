@@ -17,9 +17,7 @@ use webrtc_ice::{
     candidate::Candidate,
     url::Url,
 };
-use webrtc_sctp::{
-    association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier,
-};
+use webrtc_sctp::{association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier};
 use webrtc_util::Conn;
 
 use crate::ws::Websocket;
@@ -89,14 +87,15 @@ impl<'a> CandidateExchange<'a> {
     async fn then(&mut self, value: Either<String, String>) -> DynResult<()> {
         match value {
             Either::Left(candidate) => {
-                eprintln!("TX candidate {}", candidate);
+                log::info!("TX candidate {}", candidate);
                 self.signalling.send(candidate).await?;
             }
             Either::Right(x) if x == "Close" => {
+                log::info!("RX shutdown");
                 self.rx_shut = true;
             }
             Either::Right(candidate) => {
-                eprintln!("RX candidate {}", candidate);
+                log::info!("RX candidate {}", candidate);
                 let candidate: Arc<dyn Candidate + Send + Sync> =
                     Arc::new(self.agent.unmarshal_remote_candidate(candidate).await?);
                 self.agent.add_remote_candidate(&candidate).await?;
@@ -187,7 +186,7 @@ async fn main2() -> DynResult<()> {
             }
         }
     };
-    eprintln!("ICE connected");
+    log::info!("ICE connected");
 
     let config = webrtc_sctp::association::Config {
         net_conn,
@@ -202,7 +201,7 @@ async fn main2() -> DynResult<()> {
     let stream = association
         .open_stream(1, PayloadProtocolIdentifier::Binary)
         .await?;
-    eprintln!("Stream Connected");
+    log::info!("Stream Connected");
 
     let mut stdin = stdin();
     let mut stdout = stdout();

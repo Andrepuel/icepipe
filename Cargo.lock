@@ -316,6 +316,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "futures-util",
+ "log",
  "tokio",
  "tokio-tungstenite",
  "url",

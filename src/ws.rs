@@ -16,7 +16,7 @@ impl Websocket {
 
         let dialer = match peer_type {
             Message::Text(msg) => {
-                eprintln!("User type {:?}", msg);
+                log::info!("User type {:?}", msg);
                 msg == "DIALER"
             }
             x => Err(anyhow::anyhow!("Unexpected peer type msg {:?}", x))?,
