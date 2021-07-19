@@ -134,7 +134,11 @@ impl IceAgent {
         }
     }
 
-    pub async fn new<T: Signalling + 'static>(signalling: T, dialer: bool) -> DynResult<IceAgent> {
+    pub async fn new<T: Signalling + 'static>(
+        signalling: T,
+        dialer: bool,
+        urls: Vec<Url>,
+    ) -> DynResult<IceAgent> {
         let mut cfg = AgentConfig::default();
         cfg.local_pwd = Self::get_local(dialer).to_string();
         cfg.local_ufrag = Self::get_local(dialer).to_string();
@@ -142,8 +146,7 @@ impl IceAgent {
             .push(webrtc_ice::network_type::NetworkType::Udp4);
         cfg.network_types
             .push(webrtc_ice::network_type::NetworkType::Udp6);
-        cfg.urls
-            .push(Url::parse_url("stun:stun.l.google.com:19302")?);
+        cfg.urls = urls;
         cfg.disconnected_timeout = None;
 
         let agent = Agent::new(cfg).await?;
