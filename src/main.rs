@@ -1,5 +1,6 @@
 #![feature(backtrace)]
 
+pub mod crypto_stream;
 pub mod ice;
 pub mod pipe_stream;
 pub mod sctp;
@@ -9,12 +10,11 @@ pub mod ws;
 
 use std::{future::Future, pin::Pin, process};
 
-use anyhow::Context;
-
 use signalling::Signalling;
 use tokio::select;
 
 use crate::{
+    crypto_stream::Chacha20Stream,
     ice::IceAgent,
     pipe_stream::{Control, PipeStream, WaitThen},
     sctp::Sctp,
@@ -34,25 +34,29 @@ async fn main() -> DynResult<()> {
 }
 
 async fn main2() -> DynResult<()> {
-    let (signalling, dialer) = Websocket::new(
-        url::Url::parse(
-            &std::env::args()
-                .nth(1)
-                .ok_or(anyhow::anyhow!("Missing URL for signalling"))?,
-        )
-        .context("Invalid provided URL")?,
-    )
-    .await?;
+    let url =
+        url::Url::parse(&std::env::var("SIGNAL").expect("Signal not provided on SIGNAl variable"))
+            .unwrap();
+    let basekey = std::env::args()
+        .nth(1)
+        .ok_or(anyhow::anyhow!("Missing channel for signalling"))?;
+    let channel = Chacha20Stream::derive_text(&basekey, true, "channel");
+    let url = url.join(&channel).unwrap();
+
+    eprintln!("{}", url);
+
+    let (signalling, dialer) = Websocket::new(url).await?;
 
     let mut agent = IceAgent::new(signalling, dialer).await?;
     let net_conn = agent.connect().await?;
-    let mut sctp = Sctp::new(net_conn, dialer, agent).await?;
+    let stream = Sctp::new(net_conn, dialer, agent).await?;
+    let mut stream = Chacha20Stream::new(&basekey, dialer, stream)?;
     let mut stdio = Stdio::new();
 
-    while !sctp.rx_closed() && !stdio.rx_closed() {
+    while !stream.rx_closed() && !stdio.rx_closed() {
         select! {
-            value = sctp.wait() => {
-                let recv = sctp.then(&mut value?).await?;
+            value = stream.wait() => {
+                let recv = stream.then(&mut value?).await?;
                 if let Some(data) = recv {
                     stdio.send(&data).await?;
                 }
@@ -60,12 +64,12 @@ async fn main2() -> DynResult<()> {
             value = stdio.wait() => {
                 let recv = stdio.then(&mut value?).await?;
                 if let Some(data) = recv {
-                    sctp.send(&data).await?;
+                    stream.send(&data).await?;
                 }
             },
         }
     }
-    sctp.close().await?;
+    stream.close().await?;
     stdio.close().await?;
 
     process::exit(0);

@@ -73,7 +73,7 @@ impl WaitThen for Sctp {
     type Output = Option<Vec<u8>>;
 
     fn wait(&mut self) -> PinFutureLocal<'_, Self::Value> {
-        self.buf.resize(4096, 0);
+        self.buf.resize(8096, 0);
 
         Box::pin(async move {
             let r = select! {
