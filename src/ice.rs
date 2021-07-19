@@ -23,13 +23,25 @@ pub struct CandidateExchange {
     rx_shut: bool,
 }
 impl CandidateExchange {
-    pub fn new<T: Signalling + 'static>(
-        signalling: T,
-    ) -> (CandidateExchange, mpsc::Sender<String>) {
+    pub async fn new<T: Signalling + 'static>(
+        mut signalling: T,
+    ) -> DynResult<(CandidateExchange, mpsc::Sender<String>)> {
+        let handshake = "Icepipe";
+
+        signalling.send(handshake.into()).await?;
+        let recv = signalling.recv().await?;
+        if recv != handshake {
+            return Err(anyhow::anyhow!(
+                "Protocol errror, received: {:?}, expected {:?}",
+                recv,
+                handshake
+            ));
+        }
+
         let (candidate_tx, candidate_rx) = mpsc::channel(1);
         let signalling = Box::new(signalling);
 
-        (
+        let r = (
             CandidateExchange {
                 candidate_rx,
                 signalling,
@@ -37,7 +49,9 @@ impl CandidateExchange {
                 rx_shut: false,
             },
             candidate_tx,
-        )
+        );
+
+        Ok(r)
     }
 
     pub async fn close(&mut self) -> DynResult<()> {
@@ -133,7 +147,7 @@ impl IceAgent {
         cfg.disconnected_timeout = None;
 
         let agent = Agent::new(cfg).await?;
-        let (exchange, candidates_tx) = CandidateExchange::new(signalling);
+        let (exchange, candidates_tx) = CandidateExchange::new(signalling).await?;
         agent
             .on_candidate(Box::new(move |c| {
                 let send = candidates_tx.clone();
