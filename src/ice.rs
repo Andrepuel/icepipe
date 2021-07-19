@@ -1,0 +1,234 @@
+use std::sync::Arc;
+
+use futures_util::future::Either;
+use tokio::{select, sync::mpsc};
+use webrtc_ice::{
+    agent::{agent_config::AgentConfig, Agent},
+    candidate::Candidate,
+    url::Url,
+};
+use webrtc_util::Conn;
+
+use crate::{
+    pipe_stream::{Consume, Control, WaitThen},
+    signalling::Signalling,
+    DynResult, PinFutureLocal,
+};
+
+type CandidateExchangeValue = Either<String, String>;
+pub struct CandidateExchange {
+    candidate_rx: mpsc::Receiver<String>,
+    signalling: Box<dyn Signalling>,
+    tx_shut: bool,
+    rx_shut: bool,
+}
+impl CandidateExchange {
+    pub fn new<T: Signalling + 'static>(
+        signalling: T,
+    ) -> (CandidateExchange, mpsc::Sender<String>) {
+        let (candidate_tx, candidate_rx) = mpsc::channel(1);
+        let signalling = Box::new(signalling);
+
+        (
+            CandidateExchange {
+                candidate_rx,
+                signalling,
+                tx_shut: false,
+                rx_shut: false,
+            },
+            candidate_tx,
+        )
+    }
+
+    pub async fn close(&mut self) -> DynResult<()> {
+        if !self.tx_shut {
+            log::info!("TX shutdown");
+            self.signalling.send("Close".to_string()).await?;
+            self.tx_shut = true;
+        }
+
+        while !self.rx_shut {
+            let mut value = self.wait().await?;
+            self.then(None, &mut value).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn wait(&mut self) -> DynResult<CandidateExchangeValue> {
+        select! {
+            candidate = self.candidate_rx.recv() => {
+                Ok(Either::Left(candidate.ok_or(anyhow::anyhow!("Candidates channel closed?"))?))
+            }
+            candidate = self.signalling.recv() => {
+                Ok(Either::Right(candidate?))
+            }
+        }
+    }
+
+    pub async fn then(
+        &mut self,
+        agent: Option<&Agent>,
+        value: &mut CandidateExchangeValue,
+    ) -> DynResult<()> {
+        let value = value.consume(Either::Left(String::new()));
+        match value {
+            Either::Left(candidate) => {
+                log::info!("TX candidate {}", candidate);
+                self.signalling.send(candidate).await?;
+            }
+            Either::Right(x) if x == "Close" => {
+                log::info!("RX shutdown");
+                self.rx_shut = true;
+            }
+            Either::Right(candidate) => match agent {
+                Some(agent) => {
+                    log::info!("RX candidate {}", candidate);
+                    let candidate: Arc<dyn Candidate + Send + Sync> =
+                        Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
+                    agent.add_remote_candidate(&candidate).await?;
+                }
+                None => {
+                    log::info!("RX candidate {} discarded", candidate);
+                }
+            },
+        }
+
+        Ok(())
+    }
+}
+
+pub struct IceAgent {
+    agent: Agent,
+    exchange: CandidateExchange,
+    dialer: bool,
+}
+impl IceAgent {
+    fn get_local(dialer: bool) -> &'static str {
+        if dialer {
+            "locallocallocallocal"
+        } else {
+            "remoteremoteremoteremote"
+        }
+    }
+
+    fn get_remote(dialer: bool) -> &'static str {
+        if dialer {
+            "remoteremoteremoteremote"
+        } else {
+            "locallocallocallocal"
+        }
+    }
+
+    pub async fn new<T: Signalling + 'static>(signalling: T, dialer: bool) -> DynResult<IceAgent> {
+        let mut cfg = AgentConfig::default();
+        cfg.local_pwd = Self::get_local(dialer).to_string();
+        cfg.local_ufrag = Self::get_local(dialer).to_string();
+        cfg.network_types
+            .push(webrtc_ice::network_type::NetworkType::Udp4);
+        cfg.network_types
+            .push(webrtc_ice::network_type::NetworkType::Udp6);
+        cfg.urls
+            .push(Url::parse_url("stun:stun.l.google.com:19302")?);
+        cfg.disconnected_timeout = None;
+
+        let agent = Agent::new(cfg).await?;
+        let (exchange, candidates_tx) = CandidateExchange::new(signalling);
+        agent
+            .on_candidate(Box::new(move |c| {
+                let send = candidates_tx.clone();
+                Box::pin(async move {
+                    if let Some(c) = c {
+                        send.send(c.marshal()).await.unwrap();
+                    }
+                })
+            }))
+            .await;
+        agent.gather_candidates().await?;
+
+        Ok(IceAgent {
+            agent,
+            exchange,
+            dialer,
+        })
+    }
+
+    async fn wait2(exchange: &mut CandidateExchange) -> DynResult<<Self as WaitThen>::Value> {
+        exchange.wait().await
+    }
+
+    async fn then2(
+        agent: &Agent,
+        exchange: &mut CandidateExchange,
+        value: &mut <Self as WaitThen>::Value,
+    ) -> DynResult<()> {
+        exchange.then(Some(agent), value).await
+    }
+
+    pub async fn connect(&mut self) -> DynResult<Arc<dyn Conn + Send + Sync>> {
+        async fn do_connect(agent: &Agent, dialer: bool) -> DynResult<Arc<dyn Conn + Send + Sync>> {
+            let cancel = mpsc::channel(1);
+            let r: Arc<dyn Conn + Send + Sync> = match dialer {
+                true => {
+                    agent
+                        .dial(
+                            cancel.1,
+                            IceAgent::get_remote(dialer).to_string(),
+                            IceAgent::get_remote(dialer).to_string(),
+                        )
+                        .await?
+                }
+                false => {
+                    agent
+                        .accept(
+                            cancel.1,
+                            IceAgent::get_remote(dialer).to_string(),
+                            IceAgent::get_remote(dialer).to_string(),
+                        )
+                        .await?
+                }
+            };
+            Ok(r)
+        }
+
+        let mut conn_ing = Box::pin(do_connect(&self.agent, self.dialer));
+        let net_conn = loop {
+            let conn_ing = &mut conn_ing;
+            select! {
+                conn = conn_ing => {
+                    break conn?;
+                },
+                value = Self::wait2(&mut self.exchange) => {
+                    Self::then2(&self.agent, &mut self.exchange, &mut value?).await?;
+                }
+            }
+        };
+        log::info!("ICE connected");
+
+        Ok(net_conn)
+    }
+}
+impl WaitThen for IceAgent {
+    type Value = CandidateExchangeValue;
+    type Output = ();
+
+    fn wait(&mut self) -> PinFutureLocal<'_, Self::Value> {
+        Box::pin(async move { Self::wait2(&mut self.exchange).await })
+    }
+
+    fn then<'a>(&'a mut self, value: &'a mut Self::Value) -> PinFutureLocal<'a, Self::Output> {
+        Box::pin(async move { Self::then2(&self.agent, &mut self.exchange, value).await })
+    }
+}
+impl Control for IceAgent {
+    fn close(&mut self) -> PinFutureLocal<'_, ()> {
+        Box::pin(async move {
+            self.exchange.close().await?;
+            Ok(())
+        })
+    }
+
+    fn rx_closed(&self) -> bool {
+        self.exchange.rx_shut
+    }
+}
