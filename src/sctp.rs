@@ -63,6 +63,9 @@ impl PipeStream for Sctp {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> PinFutureLocal<'a, ()> {
         Box::pin(async move {
             self.stream.write(&data.to_owned().into()).await?;
+            while self.stream.buffered_amount() > 4 * 1024 * 1024 {
+                sleep(Duration::from_millis(100)).await;
+            }
 
             Ok(())
         })
