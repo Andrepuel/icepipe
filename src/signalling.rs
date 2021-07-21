@@ -1,6 +1,5 @@
-use crate::PinFuture;
+use crate::{pipe_stream::WaitThenDyn, PinFuture};
 
-pub trait Signalling {
+pub trait Signalling: WaitThenDyn<Output = Option<String>> {
     fn send(&mut self, candidates: String) -> PinFuture<'_, ()>;
-    fn recv(&mut self) -> PinFuture<'_, String>;
 }

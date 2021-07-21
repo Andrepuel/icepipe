@@ -42,6 +42,18 @@ where
     }
 }
 
+impl<T: WaitThenDyn + ?Sized> WaitThenDynExt for T {}
+pub trait WaitThenDynExt: WaitThenDyn {
+    fn recv(&mut self) -> PinFutureLocal<'_, Self::Output> {
+        Box::pin(async move {
+            let mut value = self.wait_dyn().await?;
+            let output = self.then_dyn(&mut value).await?;
+
+            Ok(output)
+        })
+    }
+}
+
 pub trait Control: WaitThenDyn {
     fn close(&mut self) -> PinFutureLocal<'_, ()>;
     fn rx_closed(&self) -> bool;

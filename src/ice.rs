@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use futures_util::future::Either;
 use tokio::{select, sync::mpsc};
@@ -10,12 +10,12 @@ use webrtc_ice::{
 use webrtc_util::Conn;
 
 use crate::{
-    pipe_stream::{Consume, Control, WaitThen},
+    pipe_stream::{Consume, Control, WaitThen, WaitThenDynExt},
     signalling::Signalling,
     DynResult, PinFutureLocal,
 };
 
-type CandidateExchangeValue = Either<String, String>;
+type CandidateExchangeValue = Either<String, Box<dyn Any>>;
 pub struct CandidateExchange {
     candidate_rx: mpsc::Receiver<String>,
     signalling: Box<dyn Signalling>,
@@ -29,7 +29,12 @@ impl CandidateExchange {
         let handshake = "Icepipe";
 
         signalling.send(handshake.into()).await?;
-        let recv = signalling.recv().await?;
+        let recv = loop {
+            match signalling.recv().await? {
+                Some(x) => break x,
+                None => continue,
+            }
+        };
         if recv != handshake {
             return Err(anyhow::anyhow!(
                 "Protocol errror, received: {:?}, expected {:?}",
@@ -74,7 +79,7 @@ impl CandidateExchange {
             candidate = self.candidate_rx.recv() => {
                 Ok(Either::Left(candidate.ok_or(anyhow::anyhow!("Candidates channel closed?"))?))
             }
-            candidate = self.signalling.recv() => {
+            candidate = self.signalling.wait_dyn() => {
                 Ok(Either::Right(candidate?))
             }
         }
@@ -91,20 +96,23 @@ impl CandidateExchange {
                 log::info!("TX candidate {}", candidate);
                 self.signalling.send(candidate).await?;
             }
-            Either::Right(x) if x == "Close" => {
-                log::info!("RX shutdown");
-                self.rx_shut = true;
-            }
-            Either::Right(candidate) => match agent {
-                Some(agent) => {
-                    log::info!("RX candidate {}", candidate);
-                    let candidate: Arc<dyn Candidate + Send + Sync> =
-                        Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
-                    agent.add_remote_candidate(&candidate).await?;
+            Either::Right(mut value) => match self.signalling.then_dyn(&mut value).await? {
+                None => {}
+                Some(x) if x == "Close" => {
+                    log::info!("RX shutdown");
+                    self.rx_shut = true;
                 }
-                None => {
-                    log::info!("RX candidate {} discarded", candidate);
-                }
+                Some(candidate) => match agent {
+                    Some(agent) => {
+                        log::info!("RX candidate {}", candidate);
+                        let candidate: Arc<dyn Candidate + Send + Sync> =
+                            Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
+                        agent.add_remote_candidate(&candidate).await?;
+                    }
+                    None => {
+                        log::info!("RX candidate {} discarded", candidate);
+                    }
+                },
             },
         }
 

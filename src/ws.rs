@@ -1,12 +1,19 @@
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use std::time::{Duration, Instant};
+
+use futures_util::{future::Either, SinkExt, StreamExt};
+use tokio::{net::TcpStream, select, time::sleep_until};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
-use crate::{DynResult, Signalling};
+use crate::{
+    pipe_stream::{Consume, WaitThen},
+    DynResult, Signalling,
+};
 
 pub struct Websocket {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    last_ping: Instant,
+    last_pong: Instant,
 }
 unsafe impl Send for Websocket {}
 impl Websocket {
@@ -22,7 +29,17 @@ impl Websocket {
             x => Err(anyhow::anyhow!("Unexpected peer type msg {:?}", x))?,
         };
 
-        Ok((Websocket { ws }, dialer))
+        let last_ping = Instant::now();
+        let last_pong = Instant::now();
+
+        Ok((
+            Websocket {
+                ws,
+                last_ping,
+                last_pong,
+            },
+            dialer,
+        ))
     }
 }
 impl Signalling for Websocket {
@@ -33,20 +50,62 @@ impl Signalling for Websocket {
             Ok(())
         })
     }
+}
 
-    fn recv(&mut self) -> crate::PinFuture<'_, String> {
+impl WaitThen for Websocket {
+    type Value = Either<Message, ()>;
+    type Output = Option<String>;
+
+    fn wait(&mut self) -> crate::PinFutureLocal<'_, Self::Value> {
+        let next_ping = self.last_ping + Duration::from_secs(15);
+        let pong_timeout = self.last_pong + Duration::from_secs(60);
         Box::pin(async move {
-            let msg = self
-                .ws
-                .next()
-                .await
-                .ok_or(anyhow::anyhow!("Closed signalling"))??;
-            let candidate = match msg {
-                Message::Text(candidate) => candidate,
-                x => Err(anyhow::anyhow!("Unexpected signalling {:?}", x))?,
-            };
+            select! {
+                msg = self.ws.next() => {
+                    let msg = msg.ok_or(anyhow::anyhow!("Closed signalling"))??;
+                    Ok(Either::Left(msg))
+                },
+                _ = sleep_until(next_ping.into()) => {
+                    Ok(Either::Right(()))
+                }
+                _ = sleep_until(pong_timeout.into()) => {
+                    Err(anyhow::anyhow!("Ping timeout"))
+                }
+            }
+        })
+    }
 
-            Ok(candidate)
+    fn then<'a>(
+        &'a mut self,
+        value: &'a mut Self::Value,
+    ) -> crate::PinFutureLocal<'a, Self::Output> {
+        Box::pin(async move {
+            match value {
+                Either::Left(msg) => {
+                    let msg = msg.consume(Message::Text(Default::default()));
+                    let candidate = match msg {
+                        Message::Text(candidate) => candidate,
+                        Message::Ping(a) => {
+                            self.last_ping = Instant::now();
+                            self.last_pong = Instant::now();
+                            self.ws.send(Message::Pong(a)).await?;
+                            return Ok(None);
+                        }
+                        Message::Pong(_) => {
+                            self.last_ping = Instant::now();
+                            self.last_pong = Instant::now();
+                            return Ok(None);
+                        }
+                        x => Err(anyhow::anyhow!("Unexpected signalling {:?}", x))?,
+                    };
+
+                    Ok(Some(candidate))
+                }
+                Either::Right(_) => {
+                    self.ws.send(Message::Ping(vec![])).await?;
+                    Ok(None)
+                }
+            }
         })
     }
 }
