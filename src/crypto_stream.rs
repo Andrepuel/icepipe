@@ -1,4 +1,4 @@
-use std::{any::Any, num::NonZeroU32};
+use std::any::Any;
 
 use futures_util::future::ready;
 use ring::{
@@ -6,7 +6,7 @@ use ring::{
         Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, CHACHA20_POLY1305,
     },
     error::Unspecified,
-    pbkdf2::{self, PBKDF2_HMAC_SHA256},
+    hkdf::{self, KeyType},
 };
 
 use crate::{
@@ -14,12 +14,12 @@ use crate::{
     DynResult, PinFutureLocal,
 };
 
-pub struct Sequential(u64);
+pub struct Sequential(u128);
 impl NonceSequence for Sequential {
     fn advance(&mut self) -> Result<ring::aead::Nonce, ring::error::Unspecified> {
         let seq = self.0.to_be_bytes();
         let mut nonce = [0u8; 12];
-        nonce[0..8].copy_from_slice(&seq);
+        nonce[..].copy_from_slice(&seq[4..16]);
 
         self.0 += 1;
 
@@ -34,53 +34,53 @@ pub trait RingError<T>: Into<Result<T, Unspecified>> {
 }
 impl<T> RingError<T> for Result<T, Unspecified> {}
 
+impl hkdf::KeyType for Sequential {
+    fn len(&self) -> usize {
+        16
+    }
+}
+
 pub struct Chacha20Stream {
     sealing_key: SealingKey<Sequential>,
     opening_key: OpeningKey<Sequential>,
     underlying: Box<dyn PipeStream>,
 }
 impl Chacha20Stream {
-    pub fn derive(basekey: &str, dialer: bool, salt: &str, out: &mut [u8]) {
-        let salt = format!(
-            "{}:{}",
-            match dialer {
-                true => "dialer",
-                false => "listener",
-            },
-            salt
-        );
-        pbkdf2::derive(
-            PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(4096).unwrap(),
-            salt.as_bytes(),
-            basekey.as_bytes(),
-            out,
-        );
+    pub fn derive<L: KeyType>(
+        basekey: &[u8],
+        dialer: bool,
+        salt: &str,
+        key_type: L,
+        out: &mut [u8],
+    ) {
+        let info = match dialer {
+            true => "dialer",
+            false => "listener",
+        };
+        let algorithm = hkdf::HKDF_SHA512;
+        let info = [info.as_bytes()];
+        let salt = hkdf::Salt::new(algorithm, salt.as_bytes());
+        let prk = salt.extract(basekey);
+        let okm = prk.expand(&info, key_type).unwrap();
+        okm.fill(out).unwrap();
     }
 
-    pub fn derive_text(basekey: &str, dialer: bool, salt: &str) -> String {
-        let mut data = vec![0; 32];
-        Self::derive(basekey, dialer, salt, &mut data);
-
-        base64::encode_config(&data, base64::URL_SAFE_NO_PAD)
-    }
-
-    fn get_key(basekey: &str, dialer: bool) -> DynResult<UnboundKey> {
-        let mut key_bytes = vec![0; 32];
-        Self::derive(basekey, dialer, "key", &mut key_bytes);
+    fn get_key(basekey: &[u8], dialer: bool) -> DynResult<UnboundKey> {
+        let mut key_bytes = [0; 32];
+        Self::derive(basekey, dialer, "key", &CHACHA20_POLY1305, &mut key_bytes);
 
         Ok(UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).ring_err()?)
     }
 
-    fn get_seq(basekey: &str, dialer: bool) -> Sequential {
-        let mut u64_be = [0; 8];
-        Self::derive(basekey, dialer, "seq", &mut u64_be);
+    fn get_seq(basekey: &[u8], dialer: bool) -> Sequential {
+        let mut u128_be = [0; 16];
+        Self::derive(basekey, dialer, "seq", Sequential(0), &mut u128_be);
 
-        Sequential(u64::from_be_bytes(u64_be))
+        Sequential(u128::from_be_bytes(u128_be))
     }
 
     pub fn new<T: PipeStream + 'static>(
-        basekey: &str,
+        basekey: &[u8],
         dialer: bool,
         underlying: T,
     ) -> DynResult<Chacha20Stream> {
@@ -88,7 +88,7 @@ impl Chacha20Stream {
     }
 
     pub fn new_dyn(
-        basekey: &str,
+        basekey: &[u8],
         dialer: bool,
         underlying: Box<dyn PipeStream>,
     ) -> DynResult<Chacha20Stream> {

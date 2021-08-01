@@ -1,5 +1,6 @@
 #![feature(backtrace)]
 
+pub mod agreement;
 pub mod constants;
 pub mod crypto_stream;
 pub mod ice;
@@ -15,6 +16,7 @@ use signalling::Signalling;
 use tokio::select;
 
 use crate::{
+    agreement::Agreement,
     crypto_stream::Chacha20Stream,
     ice::IceAgent,
     pipe_stream::{Control, PipeStream, WaitThen},
@@ -36,13 +38,15 @@ async fn main() -> DynResult<()> {
 
 async fn main2() -> DynResult<()> {
     let url = url::Url::parse(&constants::signalling_server()?)?;
-    let basekey = std::env::args()
+    let base_password = std::env::args()
         .nth(1)
         .ok_or(anyhow::anyhow!("Missing channel for signalling"))?;
-    let channel = Chacha20Stream::derive_text(&basekey, true, "channel");
+    let channel = Agreement::<Websocket>::derive_text(&base_password, true, "channel");
     let url = url.join(&channel).unwrap();
 
     let (signalling, dialer) = Websocket::new(url).await?;
+    let agreement = Agreement::new(signalling, base_password, dialer);
+    let (basekey, signalling) = agreement.agree().await?;
 
     let mut agent = IceAgent::new(signalling, dialer, constants::ice_urls()?).await?;
     let net_conn = agent.connect().await?;
