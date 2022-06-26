@@ -1,14 +1,12 @@
-use std::time::{Duration, Instant};
-
-use futures_util::{future::Either, SinkExt, StreamExt};
-use tokio::{net::TcpStream, select, time::sleep_until};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use url::Url;
-
 use crate::{
     pipe_stream::{Consume, WaitThen},
     DynResult, Signalling,
 };
+use futures::{future::Either, SinkExt, StreamExt};
+use std::time::{Duration, Instant};
+use tokio::{net::TcpStream, select, time::sleep_until};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use url::Url;
 
 pub struct Websocket {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -19,7 +17,10 @@ unsafe impl Send for Websocket {}
 impl Websocket {
     pub async fn new(url: Url) -> DynResult<(Websocket, bool)> {
         let (mut ws, _) = connect_async(url).await?;
-        let peer_type = ws.next().await.ok_or(anyhow::anyhow!("Closed socket"))??;
+        let peer_type = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Closed socket"))??;
 
         let dialer = match peer_type {
             Message::Text(msg) => {
@@ -62,7 +63,7 @@ impl WaitThen for Websocket {
         Box::pin(async move {
             select! {
                 msg = self.ws.next() => {
-                    let msg = msg.ok_or(anyhow::anyhow!("Closed signalling"))??;
+                    let msg = msg.ok_or_else(|| anyhow::anyhow!("Closed signalling"))??;
                     Ok(Either::Left(msg))
                 },
                 _ = sleep_until(next_ping.into()) => {

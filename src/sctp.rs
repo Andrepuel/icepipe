@@ -1,16 +1,14 @@
+use crate::{
+    pipe_stream::{Control, PipeStream, WaitThen},
+    DynResult, PinFutureLocal,
+};
+use futures::future::{ready, Either};
 use std::{any::Any, sync::Arc, time::Duration};
-
-use futures_util::future::{ready, Either};
 use tokio::{select, time::sleep};
 use webrtc_sctp::{
     association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier, stream::Stream,
 };
 use webrtc_util::Conn;
-
-use crate::{
-    pipe_stream::{Control, PipeStream, WaitThen},
-    DynResult, PinFutureLocal,
-};
 
 pub struct Sctp {
     _association: Association,

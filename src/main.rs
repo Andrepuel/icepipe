@@ -1,46 +1,44 @@
-#![feature(backtrace)]
-
 pub mod agreement;
+pub mod async_pipe_stream;
 pub mod constants;
 pub mod crypto_stream;
 pub mod ice;
 pub mod pipe_stream;
 pub mod sctp;
 pub mod signalling;
-pub mod stdio;
 pub mod ws;
-
-use std::{future::Future, pin::Pin, process};
-
-use signalling::Signalling;
-use tokio::select;
 
 use crate::{
     agreement::Agreement,
+    async_pipe_stream::AsyncPipeStream,
     crypto_stream::Chacha20Stream,
     ice::IceAgent,
     pipe_stream::{Control, PipeStream, WaitThen},
     sctp::Sctp,
-    stdio::Stdio,
     ws::Websocket,
 };
+use signalling::Signalling;
+use std::{future::Future, pin::Pin, process};
+use tokio::select;
 
 type DynResult<T> = Result<T, anyhow::Error>;
 type PinFuture<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send + 'a>>;
 type PinFutureLocal<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + 'a>>;
 
-#[tokio::main]
-async fn main() -> DynResult<()> {
+fn main() -> DynResult<()> {
     env_logger::init();
 
-    main2().await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(main2())
 }
 
 async fn main2() -> DynResult<()> {
     let url = url::Url::parse(&constants::signalling_server()?)?;
     let base_password = std::env::args()
         .nth(1)
-        .ok_or(anyhow::anyhow!("Missing channel for signalling"))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing channel for signalling"))?;
     let channel = Agreement::<Websocket>::derive_text(&base_password, true, "channel");
     let url = url.join(&channel).unwrap();
 
@@ -52,7 +50,7 @@ async fn main2() -> DynResult<()> {
     let net_conn = agent.connect().await?;
     let stream = Sctp::new(net_conn, dialer, agent).await?;
     let mut stream = Chacha20Stream::new(&basekey, dialer, stream)?;
-    let mut stdio = Stdio::new();
+    let mut stdio = AsyncPipeStream::stdio();
 
     while !stream.rx_closed() && !stdio.rx_closed() {
         select! {

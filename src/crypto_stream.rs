@@ -1,6 +1,8 @@
-use std::any::Any;
-
-use futures_util::future::ready;
+use crate::{
+    pipe_stream::{Control, PipeStream, WaitThen},
+    DynResult, PinFutureLocal,
+};
+use futures::future::ready;
 use ring::{
     aead::{
         Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, CHACHA20_POLY1305,
@@ -8,11 +10,7 @@ use ring::{
     error::Unspecified,
     hkdf::{self, KeyType},
 };
-
-use crate::{
-    pipe_stream::{Control, PipeStream, WaitThen},
-    DynResult, PinFutureLocal,
-};
+use std::any::Any;
 
 pub struct Sequential(u128);
 impl NonceSequence for Sequential {
@@ -69,7 +67,7 @@ impl Chacha20Stream {
         let mut key_bytes = [0; 32];
         Self::derive(basekey, dialer, "key", &CHACHA20_POLY1305, &mut key_bytes);
 
-        Ok(UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).ring_err()?)
+        UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).ring_err()
     }
 
     fn get_seq(basekey: &[u8], dialer: bool) -> Sequential {

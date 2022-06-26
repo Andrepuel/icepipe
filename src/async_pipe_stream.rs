@@ -1,25 +1,33 @@
-use futures_util::future::ready;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Stdin, Stdout};
-
 use crate::pipe_stream::{Control, PipeStream, WaitThen};
+use futures::future::ready;
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub struct Stdio {
-    stdin: Stdin,
-    stdout: Stdout,
+pub struct AsyncPipeStream {
+    stdin: Pin<Box<dyn AsyncRead>>,
+    stdout: Pin<Box<dyn AsyncWrite>>,
     rx_shut: bool,
     buf: Vec<u8>,
 }
-impl Stdio {
-    pub fn new() -> Stdio {
-        Stdio {
-            stdin: tokio::io::stdin(),
-            stdout: tokio::io::stdout(),
+impl AsyncPipeStream {
+    pub fn new<I, O>(stdin: I, stdout: O) -> AsyncPipeStream
+    where
+        I: AsyncRead + 'static,
+        O: AsyncWrite + 'static,
+    {
+        AsyncPipeStream {
+            stdin: Box::pin(stdin),
+            stdout: Box::pin(stdout),
             rx_shut: false,
             buf: Vec::new(),
         }
     }
+
+    pub fn stdio() -> AsyncPipeStream {
+        AsyncPipeStream::new(tokio::io::stdin(), tokio::io::stdout())
+    }
 }
-impl PipeStream for Stdio {
+impl PipeStream for AsyncPipeStream {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> crate::PinFutureLocal<'a, ()> {
         Box::pin(async move {
             self.stdout.write_all(data).await?;
@@ -27,7 +35,7 @@ impl PipeStream for Stdio {
         })
     }
 }
-impl WaitThen for Stdio {
+impl WaitThen for AsyncPipeStream {
     type Value = usize;
     type Output = Option<Vec<u8>>;
 
@@ -53,7 +61,7 @@ impl WaitThen for Stdio {
         Box::pin(ready(Ok(Some(r))))
     }
 }
-impl Control for Stdio {
+impl Control for AsyncPipeStream {
     fn close(&mut self) -> crate::PinFutureLocal<'_, ()> {
         Box::pin(async move {
             self.stdout.shutdown().await?;

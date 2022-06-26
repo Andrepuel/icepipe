@@ -1,6 +1,10 @@
+use crate::{
+    pipe_stream::{Consume, Control, WaitThen, WaitThenDynExt},
+    signalling::Signalling,
+    DynResult, PinFutureLocal,
+};
+use futures::future::Either;
 use std::{any::Any, sync::Arc};
-
-use futures_util::future::Either;
 use tokio::{select, sync::mpsc};
 use webrtc_ice::{
     agent::{agent_config::AgentConfig, Agent},
@@ -8,12 +12,6 @@ use webrtc_ice::{
     url::Url,
 };
 use webrtc_util::Conn;
-
-use crate::{
-    pipe_stream::{Consume, Control, WaitThen, WaitThenDynExt},
-    signalling::Signalling,
-    DynResult, PinFutureLocal,
-};
 
 type CandidateExchangeValue = Either<String, Box<dyn Any>>;
 pub struct CandidateExchange {
@@ -77,7 +75,7 @@ impl CandidateExchange {
     pub async fn wait(&mut self) -> DynResult<CandidateExchangeValue> {
         select! {
             candidate = self.candidate_rx.recv() => {
-                Ok(Either::Left(candidate.ok_or(anyhow::anyhow!("Candidates channel closed?"))?))
+                Ok(Either::Left(candidate.ok_or_else(||anyhow::anyhow!("Candidates channel closed?"))?))
             }
             candidate = self.signalling.wait_dyn() => {
                 Ok(Either::Right(candidate?))
@@ -147,15 +145,17 @@ impl IceAgent {
         dialer: bool,
         urls: Vec<Url>,
     ) -> DynResult<IceAgent> {
-        let mut cfg = AgentConfig::default();
-        cfg.local_pwd = Self::get_local(dialer).to_string();
-        cfg.local_ufrag = Self::get_local(dialer).to_string();
-        cfg.network_types
-            .push(webrtc_ice::network_type::NetworkType::Udp4);
-        cfg.network_types
-            .push(webrtc_ice::network_type::NetworkType::Udp6);
-        cfg.urls = urls;
-        cfg.disconnected_timeout = None;
+        let cfg = AgentConfig {
+            local_pwd: Self::get_local(dialer).to_string(),
+            local_ufrag: Self::get_local(dialer).to_string(),
+            network_types: vec![
+                webrtc_ice::network_type::NetworkType::Udp4,
+                webrtc_ice::network_type::NetworkType::Udp6,
+            ],
+            urls,
+            disconnected_timeout: None,
+            ..AgentConfig::default()
+        };
 
         let agent = Agent::new(cfg).await?;
         let (exchange, candidates_tx) = CandidateExchange::new(signalling).await?;

@@ -1,10 +1,8 @@
-use std::num::NonZeroU32;
-
-use ring::{agreement, hmac, pbkdf2, rand::SystemRandom};
-
 use crate::{
     crypto_stream::RingError, pipe_stream::WaitThenDynExt, signalling::Signalling, DynResult,
 };
+use ring::{agreement, hmac, pbkdf2, rand::SystemRandom};
+use std::num::NonZeroU32;
 
 pub struct Agreement<T: Signalling> {
     signalling: T,
@@ -91,7 +89,7 @@ impl<T: Signalling> Agreement<T> {
             hmac::HMAC_SHA512,
             &Self::derive_len(&self.psk, dialer, "keymaterial_check", 32),
         );
-        hmac::sign(&key, &key_material)
+        hmac::sign(&key, key_material)
     }
 
     async fn signalling_recv(&mut self) -> DynResult<String> {
