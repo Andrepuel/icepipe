@@ -1,6 +1,7 @@
 use crate::{
     pipe_stream::{Consume, WaitThen},
-    DynResult, Signalling,
+    signalling::Signalling,
+    DynResult,
 };
 use futures::{future::Either, SinkExt, StreamExt};
 use std::time::{Duration, Instant};

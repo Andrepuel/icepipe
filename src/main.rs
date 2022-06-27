@@ -1,29 +1,16 @@
-pub mod agreement;
-pub mod async_pipe_stream;
-pub mod constants;
-pub mod crypto_stream;
-pub mod ice;
-pub mod pipe_stream;
-pub mod sctp;
-pub mod signalling;
-pub mod ws;
-
-use crate::{
+use icepipe::{
     agreement::Agreement,
     async_pipe_stream::AsyncPipeStream,
+    constants,
     crypto_stream::Chacha20Stream,
     ice::IceAgent,
     pipe_stream::{Control, PipeStream, WaitThen},
     sctp::Sctp,
     ws::Websocket,
+    DynResult,
 };
-use signalling::Signalling;
-use std::{future::Future, pin::Pin, process};
+use std::process;
 use tokio::select;
-
-type DynResult<T> = Result<T, anyhow::Error>;
-type PinFuture<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send + 'a>>;
-type PinFutureLocal<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + 'a>>;
 
 fn main() -> DynResult<()> {
     env_logger::init();
