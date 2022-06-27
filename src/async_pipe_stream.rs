@@ -3,21 +3,31 @@ use futures::future::ready;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub type DynAsyncRead = Pin<Box<dyn AsyncRead>>;
+pub type DynAsyncWrite = Pin<Box<dyn AsyncWrite>>;
+
 pub struct AsyncPipeStream {
-    stdin: Pin<Box<dyn AsyncRead>>,
-    stdout: Pin<Box<dyn AsyncWrite>>,
+    input: Pin<Box<dyn AsyncRead>>,
+    output: Pin<Box<dyn AsyncWrite>>,
     rx_shut: bool,
     buf: Vec<u8>,
 }
 impl AsyncPipeStream {
-    pub fn new<I, O>(stdin: I, stdout: O) -> AsyncPipeStream
+    pub fn new<I, O>(input: I, output: O) -> AsyncPipeStream
     where
         I: AsyncRead + 'static,
         O: AsyncWrite + 'static,
     {
+        let stdin = Box::pin(input);
+        let stdout = Box::pin(output);
+
+        AsyncPipeStream::new_dyn(stdin, stdout)
+    }
+
+    pub fn new_dyn(input: DynAsyncRead, output: DynAsyncWrite) -> AsyncPipeStream {
         AsyncPipeStream {
-            stdin: Box::pin(stdin),
-            stdout: Box::pin(stdout),
+            input,
+            output,
             rx_shut: false,
             buf: Vec::new(),
         }
@@ -30,7 +40,7 @@ impl AsyncPipeStream {
 impl PipeStream for AsyncPipeStream {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> crate::PinFutureLocal<'a, ()> {
         Box::pin(async move {
-            self.stdout.write_all(data).await?;
+            self.output.write_all(data).await?;
             Ok(())
         })
     }
@@ -42,7 +52,7 @@ impl WaitThen for AsyncPipeStream {
     fn wait(&mut self) -> crate::PinFutureLocal<'_, Self::Value> {
         self.buf.resize(4096, 0);
         Box::pin(async move {
-            let n = self.stdin.read(&mut self.buf).await?;
+            let n = self.input.read(&mut self.buf).await?;
             Ok(n)
         })
     }
@@ -64,7 +74,7 @@ impl WaitThen for AsyncPipeStream {
 impl Control for AsyncPipeStream {
     fn close(&mut self) -> crate::PinFutureLocal<'_, ()> {
         Box::pin(async move {
-            self.stdout.shutdown().await?;
+            self.output.shutdown().await?;
             Ok(())
         })
     }
