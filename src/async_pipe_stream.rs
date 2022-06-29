@@ -41,6 +41,7 @@ impl PipeStream for AsyncPipeStream {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> crate::PinFutureLocal<'a, ()> {
         Box::pin(async move {
             self.output.write_all(data).await?;
+            self.output.flush().await?;
             Ok(())
         })
     }
