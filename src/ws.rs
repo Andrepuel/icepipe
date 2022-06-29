@@ -104,6 +104,7 @@ impl WaitThen for Websocket {
                     Ok(Some(candidate))
                 }
                 Either::Right(_) => {
+                    self.last_ping = Instant::now();
                     self.ws.send(Message::Ping(vec![])).await?;
                     Ok(None)
                 }
