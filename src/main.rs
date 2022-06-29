@@ -11,7 +11,7 @@ use icepipe::{
     DynResult,
 };
 use std::{process, str::FromStr};
-use tokio::select;
+use tokio::{net::TcpStream, select};
 
 fn main() -> DynResult<()> {
     env_logger::init();
@@ -43,6 +43,10 @@ struct Args {
     /// Specify output file path to b created with contents received from peer. Default: write to standard output
     #[clap(short = 'o', long = "output")]
     output: Option<String>,
+
+    /// Forwards both input and output to a new TCP connection established with the specified address.
+    #[clap(short = 'W', long = "tcp-forward")]
+    tcp_forward: Option<String>,
 }
 
 async fn main2() -> DynResult<()> {
@@ -79,14 +83,34 @@ async fn main2() -> DynResult<()> {
     let stream = Sctp::new(net_conn, dialer, agent).await?;
     let mut peer_stream = Chacha20Stream::new(&basekey, dialer, stream)?;
 
-    let input: DynAsyncRead = match args.input {
-        Some(path) => Box::pin(tokio::fs::File::open(path).await?),
-        None => Box::pin(tokio::io::stdin()),
-    };
-    let output: DynAsyncWrite = match args.output {
-        Some(path) => Box::pin(tokio::fs::File::create(path).await?),
-        None => Box::pin(tokio::io::stdout()),
-    };
+    let input: DynAsyncRead;
+    let output: DynAsyncWrite;
+    if let Some(tcp_forward) = args.tcp_forward {
+        assert!(
+            args.input.is_none(),
+            "--input and --tcp-forward are mutually exclusive"
+        );
+        assert!(
+            args.output.is_none(),
+            "--output and --tcp-forward are mutually exclusive"
+        );
+
+        log::info!("Connecting to {tcp_forward}");
+        let tcp_stream = TcpStream::connect(tcp_forward).await?;
+        let (read, write) = tcp_stream.into_split();
+        input = Box::pin(read);
+        output = Box::pin(write);
+    } else {
+        input = match args.input {
+            Some(path) => Box::pin(tokio::fs::File::open(path).await?),
+            None => Box::pin(tokio::io::stdin()),
+        };
+        output = match args.output {
+            Some(path) => Box::pin(tokio::fs::File::create(path).await?),
+            None => Box::pin(tokio::io::stdout()),
+        };
+    }
+
     let mut local_stream = AsyncPipeStream::new_dyn(input, output);
 
     while !peer_stream.rx_closed() && !local_stream.rx_closed() {
