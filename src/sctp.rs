@@ -114,7 +114,7 @@ impl Control for Sctp {
             sleep(Duration::from_millis(100)).await;
 
             self.underlying.close().await?;
-            self.stream.close().await?;
+            self.stream.shutdown(std::net::Shutdown::Both).await?;
 
             Ok(())
         })

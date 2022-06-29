@@ -8,7 +8,7 @@ use std::{any::Any, sync::Arc};
 use tokio::{select, sync::mpsc};
 use webrtc_ice::{
     agent::{agent_config::AgentConfig, Agent},
-    candidate::Candidate,
+    candidate::{candidate_base::unmarshal_candidate, Candidate},
     url::Url,
 };
 use webrtc_util::Conn;
@@ -104,7 +104,7 @@ impl CandidateExchange {
                     Some(agent) => {
                         log::info!("RX candidate {}", candidate);
                         let candidate: Arc<dyn Candidate + Send + Sync> =
-                            Arc::new(agent.unmarshal_remote_candidate(candidate).await?);
+                            Arc::new(unmarshal_candidate(&candidate).await?);
                         agent.add_remote_candidate(&candidate).await?;
                     }
                     None => {
