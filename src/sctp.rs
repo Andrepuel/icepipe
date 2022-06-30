@@ -103,7 +103,6 @@ impl WaitThen for Sctp {
                 },
                 r = self.stream.read_sctp(&mut self.buf[..]) => {
                     let (n, protocol_id) = r?;
-                    log::info!("SCTP read {n} {protocol_id:?}");
                     Either::Right((n, protocol_id))
                 }
             };
