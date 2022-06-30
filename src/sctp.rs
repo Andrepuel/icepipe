@@ -2,7 +2,11 @@ use crate::{
     pipe_stream::{Control, PipeStream, WaitThen},
     DynResult, PinFutureLocal,
 };
-use futures::future::{ready, Either};
+use bytes::Bytes;
+use futures::{
+    future::{ready, Either},
+    FutureExt,
+};
 use std::{any::Any, sync::Arc, time::Duration};
 use tokio::{select, time::sleep};
 use webrtc_sctp::{
@@ -42,8 +46,22 @@ impl Sctp {
             false => Association::server(config).await?,
         };
 
-        let stream = association
-            .open_stream(1, PayloadProtocolIdentifier::Binary)
+        let stream = match dialer {
+            true => {
+                association
+                    .open_stream(1, PayloadProtocolIdentifier::Binary)
+                    .await?
+            }
+            false => association
+                .accept_stream()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Association closed when waiting for stream"))?,
+        };
+        stream
+            .write_sctp(
+                &Bytes::from_static(b"\0"),
+                PayloadProtocolIdentifier::StringEmpty,
+            )
             .await?;
         log::info!("Stream Connected");
 
@@ -60,7 +78,9 @@ impl Sctp {
 impl PipeStream for Sctp {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> PinFutureLocal<'a, ()> {
         Box::pin(async move {
-            self.stream.write(&data.to_owned().into()).await?;
+            self.stream
+                .write_sctp(&data.to_owned().into(), PayloadProtocolIdentifier::Binary)
+                .await?;
             while self.stream.buffered_amount() > 4 * 1024 * 1024 {
                 sleep(Duration::from_millis(100)).await;
             }
@@ -70,7 +90,7 @@ impl PipeStream for Sctp {
     }
 }
 impl WaitThen for Sctp {
-    type Value = Either<Box<dyn Any>, usize>;
+    type Value = Either<Box<dyn Any>, (usize, PayloadProtocolIdentifier)>;
     type Output = Option<Vec<u8>>;
 
     fn wait(&mut self) -> PinFutureLocal<'_, Self::Value> {
@@ -81,8 +101,10 @@ impl WaitThen for Sctp {
                 value = self.underlying.wait_dyn() => {
                     Either::Left(value?)
                 },
-                n = self.stream.read(&mut self.buf[..]) => {
-                    Either::Right(n?)
+                r = self.stream.read_sctp(&mut self.buf[..]) => {
+                    let (n, protocol_id) = r?;
+                    log::info!("SCTP read {n} {protocol_id:?}");
+                    Either::Right((n, protocol_id))
                 }
             };
             Ok(r)
@@ -98,8 +120,12 @@ impl WaitThen for Sctp {
                     Ok(None)
                 })
             }
-            Either::Right(value) => {
-                let r = self.buf[0..*value].to_owned();
+            Either::Right((n, protocol_id)) => {
+                if *protocol_id != PayloadProtocolIdentifier::Binary {
+                    return ready(Ok(None)).boxed();
+                }
+
+                let r = self.buf[0..*n].to_owned();
                 Box::pin(ready(Ok(Some(r))))
             }
         }
