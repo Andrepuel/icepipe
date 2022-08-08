@@ -11,7 +11,10 @@ use icepipe::{
     DynResult,
 };
 use std::{process, str::FromStr};
-use tokio::{net::TcpStream, select};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    select,
+};
 
 fn main() -> DynResult<()> {
     env_logger::init();
@@ -39,6 +42,10 @@ struct Args {
     /// Specify input file path to be forward to the peer. Default: read from standard input
     #[clap(short = 'i', long = "input")]
     input: Option<String>,
+
+    /// Specify input file as a listening port that will accept one connection.
+    #[clap(short = 'L', long = "tcp-input")]
+    tcp_input: Option<String>,
 
     /// Specify output file path to b created with contents received from peer. Default: write to standard output
     #[clap(short = 'o', long = "output")]
@@ -85,7 +92,26 @@ async fn main2() -> DynResult<()> {
 
     let input: DynAsyncRead;
     let output: DynAsyncWrite;
-    if let Some(tcp_forward) = args.tcp_forward {
+    if let Some(tcp_input) = args.tcp_input {
+        assert!(
+            args.input.is_none(),
+            "--input and --tcp-input are mutually exclusive"
+        );
+        assert!(
+            args.output.is_none(),
+            "--output and --tcp-input are mutually exclusive"
+        );
+        assert!(
+            args.tcp_forward.is_none(),
+            "--tcp-input and --tcp-forward are mutually exclusive"
+        );
+
+        let tcp_listen = TcpListener::bind(tcp_input).await?;
+        let (tcp_stream, _) = tcp_listen.accept().await?;
+        let (read, write) = tcp_stream.into_split();
+        input = Box::pin(read);
+        output = Box::pin(write);
+    } else if let Some(tcp_forward) = args.tcp_forward {
         assert!(
             args.input.is_none(),
             "--input and --tcp-forward are mutually exclusive"
