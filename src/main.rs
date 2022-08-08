@@ -166,7 +166,7 @@ trait Optional: Sized {
 }
 impl<T> Optional for Vec<T> {
     fn into_option(self) -> Option<Self> {
-        (!self.is_empty()).then(move || self)
+        (!self.is_empty()).then_some(self)
     }
 }
 

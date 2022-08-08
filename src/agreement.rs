@@ -36,7 +36,7 @@ impl<T: Signalling> Agreement<T> {
 
     pub fn derive_text(basekey: &str, dialer: bool, salt: &str) -> String {
         base64::encode_config(
-            &Self::derive_len(basekey, dialer, salt, 32),
+            Self::derive_len(basekey, dialer, salt, 32),
             base64::URL_SAFE_NO_PAD,
         )
     }
@@ -73,9 +73,9 @@ impl<T: Signalling> Agreement<T> {
         let auth_tx = self.key_material_check_tag(&key_material, self.dialer);
         let auth_rx = self.key_material_check_tag(&key_material, !self.dialer);
 
-        self.signalling.send(base64::encode(&auth_tx)).await?;
+        self.signalling.send(base64::encode(auth_tx)).await?;
         let auth_rx_rx = self.signalling_recv().await?;
-        if auth_rx.as_ref() != base64::decode(&auth_rx_rx)? {
+        if auth_rx.as_ref() != base64::decode(auth_rx_rx)? {
             return Err(anyhow::anyhow!(
                 "Mismatch authentication tag on key agreement based on PSK."
             ));
