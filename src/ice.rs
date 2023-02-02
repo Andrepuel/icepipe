@@ -1,5 +1,5 @@
 use crate::{
-    pipe_stream::{Consume, Control, WaitThen, WaitThenDynExt},
+    pipe_stream::{Control, WaitThen, WaitThenDynExt},
     signalling::Signalling,
     DynResult, PinFutureLocal,
 };
@@ -88,7 +88,7 @@ impl CandidateExchange {
         agent: Option<&Agent>,
         value: &mut CandidateExchangeValue,
     ) -> DynResult<()> {
-        let value = value.consume(Either::Left(String::new()));
+        let value = std::mem::replace(value, Either::Left(Default::default()));
         match value {
             Either::Left(candidate) => {
                 log::info!("TX candidate {}", candidate);

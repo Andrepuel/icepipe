@@ -1,6 +1,5 @@
-use std::{any::Any, borrow::BorrowMut};
-
 use crate::PinFutureLocal;
+use std::any::Any;
 
 pub trait WaitThen {
     type Value;
@@ -62,15 +61,3 @@ pub trait Control: WaitThenDyn {
 pub trait PipeStream: WaitThenDyn<Output = Option<Vec<u8>>> + Control {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> PinFutureLocal<'a, ()>;
 }
-
-pub trait Consume<T>: BorrowMut<T>
-where
-    Self: Sized,
-{
-    fn consume(mut self, mut new: T) -> T {
-        let old = self.borrow_mut();
-        std::mem::swap(&mut new, old);
-        new
-    }
-}
-impl<T> Consume<T> for &mut T {}

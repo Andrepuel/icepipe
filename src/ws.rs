@@ -1,8 +1,4 @@
-use crate::{
-    pipe_stream::{Consume, WaitThen},
-    signalling::Signalling,
-    DynResult,
-};
+use crate::{pipe_stream::WaitThen, signalling::Signalling, DynResult};
 use futures::{future::Either, SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::{net::TcpStream, select, time::sleep_until};
@@ -84,7 +80,7 @@ impl WaitThen for Websocket {
         Box::pin(async move {
             match value {
                 Either::Left(msg) => {
-                    let msg = msg.consume(Message::Text(Default::default()));
+                    let msg = std::mem::replace(msg, Message::Text(Default::default()));
                     let candidate = match msg {
                         Message::Text(candidate) => candidate,
                         Message::Ping(a) => {
