@@ -1,6 +1,6 @@
 [package]
 name = "icepipe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license-file = "LICENSE"
 description = "Peer to Peer communication encrypted using WebRTC"
