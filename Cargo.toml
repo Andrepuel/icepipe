@@ -2,6 +2,11 @@
 name = "icepipe"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+description = "Peer to Peer communication encrypted using WebRTC"
+repository = "https://github.com/Andrepuel/icepipe"
+categories = ["cryptography", "network-programming"]
+keywords = ["socket", "sctp", "udp"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
