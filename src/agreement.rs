@@ -1,6 +1,10 @@
 use crate::{
     crypto_stream::RingError, pipe_stream::WaitThenDynExt, signalling::Signalling, DynResult,
 };
+use base64::{
+    prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
+    Engine,
+};
 use ring::{agreement, hmac, pbkdf2, rand::SystemRandom};
 use std::num::NonZeroU32;
 
@@ -35,10 +39,7 @@ impl<T: Signalling> Agreement<T> {
     }
 
     pub fn derive_text(basekey: &str, dialer: bool, salt: &str) -> String {
-        base64::encode_config(
-            Self::derive_len(basekey, dialer, salt, 32),
-            base64::URL_SAFE_NO_PAD,
-        )
+        BASE64_URL_SAFE_NO_PAD.encode(Self::derive_len(basekey, dialer, salt, 32))
     }
 
     pub fn new(signalling: T, psk: String, dialer: bool) -> Agreement<T> {
@@ -55,11 +56,13 @@ impl<T: Signalling> Agreement<T> {
             agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).ring_err()?;
         let my_public_key = my_private_key.compute_public_key().ring_err()?;
 
-        self.signalling.send(base64::encode(&my_public_key)).await?;
+        self.signalling
+            .send(BASE64_STANDARD.encode(&my_public_key))
+            .await?;
         let peer_public_key = self.signalling_recv().await?;
         let peer_public_key = agreement::UnparsedPublicKey::new(
             &agreement::X25519,
-            base64::decode(&peer_public_key)?,
+            BASE64_STANDARD.decode(&peer_public_key)?,
         );
 
         let key_material = agreement::agree_ephemeral(
@@ -73,9 +76,11 @@ impl<T: Signalling> Agreement<T> {
         let auth_tx = self.key_material_check_tag(&key_material, self.dialer);
         let auth_rx = self.key_material_check_tag(&key_material, !self.dialer);
 
-        self.signalling.send(base64::encode(auth_tx)).await?;
+        self.signalling
+            .send(BASE64_STANDARD.encode(auth_tx))
+            .await?;
         let auth_rx_rx = self.signalling_recv().await?;
-        if auth_rx.as_ref() != base64::decode(auth_rx_rx)? {
+        if auth_rx.as_ref() != BASE64_STANDARD.decode(auth_rx_rx)? {
             return Err(anyhow::anyhow!(
                 "Mismatch authentication tag on key agreement based on PSK."
             ));

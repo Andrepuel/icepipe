@@ -57,12 +57,10 @@ impl Sctp {
                 .await
                 .ok_or_else(|| anyhow::anyhow!("Association closed when waiting for stream"))?,
         };
-        stream
-            .write_sctp(
-                &Bytes::from_static(b"\0"),
-                PayloadProtocolIdentifier::StringEmpty,
-            )
-            .await?;
+        stream.write_sctp(
+            &Bytes::from_static(b"\0"),
+            PayloadProtocolIdentifier::StringEmpty,
+        )?;
         log::info!("Stream Connected");
 
         let buf = Vec::new();
@@ -79,8 +77,7 @@ impl PipeStream for Sctp {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> PinFutureLocal<'a, ()> {
         Box::pin(async move {
             self.stream
-                .write_sctp(&data.to_owned().into(), PayloadProtocolIdentifier::Binary)
-                .await?;
+                .write_sctp(&data.to_owned().into(), PayloadProtocolIdentifier::Binary)?;
             while self.stream.buffered_amount() > 4 * 1024 * 1024 {
                 sleep(Duration::from_millis(100)).await;
             }

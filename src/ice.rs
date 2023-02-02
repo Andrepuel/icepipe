@@ -104,8 +104,8 @@ impl CandidateExchange {
                     Some(agent) => {
                         log::info!("RX candidate {}", candidate);
                         let candidate: Arc<dyn Candidate + Send + Sync> =
-                            Arc::new(unmarshal_candidate(&candidate).await?);
-                        agent.add_remote_candidate(&candidate).await?;
+                            Arc::new(unmarshal_candidate(&candidate)?);
+                        agent.add_remote_candidate(&candidate)?;
                     }
                     None => {
                         log::info!("RX candidate {} discarded", candidate);
@@ -159,17 +159,16 @@ impl IceAgent {
 
         let agent = Agent::new(cfg).await?;
         let (exchange, candidates_tx) = CandidateExchange::new(signalling).await?;
-        agent
-            .on_candidate(Box::new(move |c| {
-                let send = candidates_tx.clone();
-                Box::pin(async move {
-                    if let Some(c) = c {
-                        send.send(c.marshal()).await.unwrap();
-                    }
-                })
-            }))
-            .await;
-        agent.gather_candidates().await?;
+        agent.on_candidate(Box::new(move |c| {
+            let send = candidates_tx.clone();
+            Box::pin(async move {
+                if let Some(c) = c {
+                    send.send(c.marshal()).await.unwrap();
+                }
+            })
+        }));
+
+        agent.gather_candidates()?;
 
         Ok(IceAgent {
             agent,
