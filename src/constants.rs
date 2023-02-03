@@ -21,8 +21,8 @@ fn bytes_to_str(env: &str, bytes: &'static [u8]) -> Option<String> {
         |_| {
             let fallback = unsafe { CStr::from_ptr(bytes.as_ptr() as *const i8) };
             let fallback = fallback.to_str().unwrap();
-            let fallback = match fallback.find("__") {
-                Some(idx) => &fallback[idx + 2..],
+            let fallback = match fallback.split_once("__") {
+                Some((_, url)) => url,
                 None => fallback,
             };
             match fallback.len() {

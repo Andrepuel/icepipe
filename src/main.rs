@@ -1,16 +1,10 @@
 use clap::Parser;
 use icepipe::{
-    agreement::Agreement,
     async_pipe_stream::{AsyncPipeStream, DynAsyncRead, DynAsyncWrite},
-    constants,
-    crypto_stream::Chacha20Stream,
-    ice::IceAgent,
     pipe_stream::{Control, PipeStream, WaitThen},
-    sctp::Sctp,
-    ws::Websocket,
     DynResult,
 };
-use std::{process, str::FromStr};
+use std::process;
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
@@ -59,36 +53,8 @@ struct Args {
 async fn main2() -> DynResult<()> {
     let args = Args::parse();
 
-    let signaling = args
-        .signaling
-        .or_else(constants::signalling_server)
-        .ok_or_else(|| {
-            anyhow::anyhow!("No default value available for signaling, must provide one")
-        })?;
-    let signaling = url::Url::parse(&signaling)?;
-
-    let ice_urls = args
-        .ice
-        .into_option()
-        .or_else(|| constants::ice_urls().into_option())
-        .ok_or_else(|| anyhow::anyhow!("No default value available for ice, must provide one"))?;
-    let ice_urls = ice_urls
-        .into_iter()
-        .map(|s| ParseUrl::from_str(&s).map(|u| u.0))
-        .collect::<DynResult<_>>()?;
-
-    let base_password = args.channel;
-    let channel = Agreement::<Websocket>::derive_text(&base_password, true, "channel");
-    let url = signaling.join(&channel).unwrap();
-
-    let (signalling, dialer) = Websocket::new(url).await?;
-    let agreement = Agreement::new(signalling, base_password, dialer);
-    let (basekey, signalling) = agreement.agree().await?;
-
-    let mut agent = IceAgent::new(signalling, dialer, ice_urls).await?;
-    let net_conn = agent.connect().await?;
-    let stream = Sctp::new(net_conn, dialer, agent).await?;
-    let mut peer_stream = Chacha20Stream::new(&basekey, dialer, stream)?;
+    let mut peer_stream =
+        icepipe::connect(&args.channel, args.signaling.as_deref(), &args.ice).await?;
 
     let input: DynAsyncRead;
     let output: DynAsyncWrite;
@@ -159,32 +125,4 @@ async fn main2() -> DynResult<()> {
     local_stream.close().await?;
 
     process::exit(0);
-}
-
-trait Optional: Sized {
-    fn into_option(self) -> Option<Self>;
-}
-impl<T> Optional for Vec<T> {
-    fn into_option(self) -> Option<Self> {
-        (!self.is_empty()).then_some(self)
-    }
-}
-
-struct ParseUrl(webrtc_ice::url::Url);
-impl FromStr for ParseUrl {
-    type Err = anyhow::Error;
-
-    fn from_str(url: &str) -> Result<Self, Self::Err> {
-        let mut fields = url.split('&');
-        let url = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Empty STUN url"))?;
-        let username = fields.next();
-        let password = fields.next();
-        let mut url = webrtc_ice::url::Url::parse_url(url)?;
-        url.username = username.unwrap_or_default().to_owned();
-        url.password = password.unwrap_or_default().to_owned();
-
-        DynResult::Ok(ParseUrl(url))
-    }
 }
