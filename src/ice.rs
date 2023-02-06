@@ -1,10 +1,13 @@
 use crate::{
-    pipe_stream::{Control, WaitThen, WaitThenDynExt},
+    pipe_stream::{Control, WaitThen},
     signalling::Signalling,
-    DynResult, PinFutureLocal,
+    IntoIoError,
 };
-use futures::future::Either;
-use std::{any::Any, sync::Arc};
+use futures::{
+    future::{Either, LocalBoxFuture},
+    pin_mut,
+};
+use std::{io, sync::Arc};
 use tokio::{select, sync::mpsc};
 use webrtc_ice::{
     agent::{agent_config::AgentConfig, Agent},
@@ -13,36 +16,38 @@ use webrtc_ice::{
 };
 use webrtc_util::Conn;
 
-type CandidateExchangeValue = Either<String, Box<dyn Any>>;
-pub struct CandidateExchange {
+const PROTOCOL_START: &str = "Icepipe";
+const PROTOCOL_CLOSE: &str = "Close";
+
+type CandidateExchangeValue<S> = Either<String, <S as WaitThen>::Value>;
+pub struct CandidateExchange<S: Signalling> {
     candidate_rx: mpsc::Receiver<String>,
-    signalling: Box<dyn Signalling>,
+    signalling: S,
     tx_shut: bool,
     rx_shut: bool,
 }
-impl CandidateExchange {
-    pub async fn new<T: Signalling + 'static>(
-        mut signalling: T,
-    ) -> DynResult<(CandidateExchange, mpsc::Sender<String>)> {
-        let handshake = "Icepipe";
-
-        signalling.send(handshake.into()).await?;
+impl<S: Signalling> CandidateExchange<S> {
+    pub async fn new(mut signalling: S) -> IceResult<(Self, mpsc::Sender<String>), S::Error> {
+        signalling
+            .send(PROTOCOL_START.into())
+            .await
+            .map_err(IceError::SignalingError)?;
         let recv = loop {
-            match signalling.recv().await? {
-                Some(x) => break x,
-                None => continue,
+            let mut value = signalling.wait().await.map_err(IceError::SignalingError)?;
+            if let Some(recv) = signalling
+                .then(&mut value)
+                .await
+                .map_err(IceError::SignalingError)?
+            {
+                break recv;
             }
         };
-        if recv != handshake {
-            return Err(anyhow::anyhow!(
-                "Protocol errror, received: {:?}, expected {:?}",
-                recv,
-                handshake
-            ));
+
+        if recv != PROTOCOL_START {
+            return Err(IceError::BadHandshake(recv));
         }
 
         let (candidate_tx, candidate_rx) = mpsc::channel(1);
-        let signalling = Box::new(signalling);
 
         let r = (
             CandidateExchange {
@@ -57,10 +62,13 @@ impl CandidateExchange {
         Ok(r)
     }
 
-    pub async fn close(&mut self) -> DynResult<()> {
+    pub async fn close(&mut self) -> IceResult<(), S::Error> {
         if !self.tx_shut {
             log::info!("TX shutdown");
-            self.signalling.send("Close".to_string()).await?;
+            self.signalling
+                .send(PROTOCOL_CLOSE.to_string())
+                .await
+                .map_err(IceError::SignalingError)?;
             self.tx_shut = true;
         }
 
@@ -72,13 +80,14 @@ impl CandidateExchange {
         Ok(())
     }
 
-    pub async fn wait(&mut self) -> DynResult<CandidateExchangeValue> {
+    pub async fn wait(&mut self) -> IceResult<CandidateExchangeValue<S>, S::Error> {
         select! {
             candidate = self.candidate_rx.recv() => {
-                Ok(Either::Left(candidate.ok_or_else(||anyhow::anyhow!("Candidates channel closed?"))?))
+                let candidate = candidate.expect("Candidate channel closed on handler side");
+                Ok(Either::Left(candidate))
             }
-            candidate = self.signalling.wait_dyn() => {
-                Ok(Either::Right(candidate?))
+            candidate = self.signalling.wait() => {
+                Ok(Either::Right(candidate.map_err(IceError::SignalingError)?))
             }
         }
     }
@@ -86,17 +95,26 @@ impl CandidateExchange {
     pub async fn then(
         &mut self,
         agent: Option<&Agent>,
-        value: &mut CandidateExchangeValue,
-    ) -> DynResult<()> {
+        value: &mut CandidateExchangeValue<S>,
+    ) -> IceResult<(), S::Error> {
         let value = std::mem::replace(value, Either::Left(Default::default()));
         match value {
             Either::Left(candidate) => {
                 log::info!("TX candidate {}", candidate);
-                self.signalling.send(candidate).await?;
+                self.signalling
+                    .send(candidate)
+                    .await
+                    .map_err(IceError::SignalingError)?;
             }
-            Either::Right(mut value) => match self.signalling.then_dyn(&mut value).await? {
+            Either::Right(mut value) => match self
+                .signalling
+                .then(&mut value)
+                .await
+                .map_err(IceError::SignalingError)?
+                .as_deref()
+            {
                 None => {}
-                Some(x) if x == "Close" => {
+                Some(PROTOCOL_CLOSE) => {
                     log::info!("RX shutdown");
                     self.rx_shut = true;
                 }
@@ -104,7 +122,7 @@ impl CandidateExchange {
                     Some(agent) => {
                         log::info!("RX candidate {}", candidate);
                         let candidate: Arc<dyn Candidate + Send + Sync> =
-                            Arc::new(unmarshal_candidate(&candidate)?);
+                            Arc::new(unmarshal_candidate(candidate)?);
                         agent.add_remote_candidate(&candidate)?;
                     }
                     None => {
@@ -118,36 +136,16 @@ impl CandidateExchange {
     }
 }
 
-pub struct IceAgent {
+pub struct IceAgent<S: Signalling> {
     agent: Agent,
-    exchange: CandidateExchange,
+    exchange: CandidateExchange<S>,
     dialer: bool,
 }
-impl IceAgent {
-    fn get_local(dialer: bool) -> &'static str {
-        if dialer {
-            "locallocallocallocal"
-        } else {
-            "remoteremoteremoteremote"
-        }
-    }
-
-    fn get_remote(dialer: bool) -> &'static str {
-        if dialer {
-            "remoteremoteremoteremote"
-        } else {
-            "locallocallocallocal"
-        }
-    }
-
-    pub async fn new<T: Signalling + 'static>(
-        signalling: T,
-        dialer: bool,
-        urls: Vec<Url>,
-    ) -> DynResult<IceAgent> {
+impl<S: Signalling> IceAgent<S> {
+    pub async fn new(signalling: S, dialer: bool, urls: Vec<Url>) -> IceResult<Self, S::Error> {
         let cfg = AgentConfig {
-            local_pwd: Self::get_local(dialer).to_string(),
-            local_ufrag: Self::get_local(dialer).to_string(),
+            local_pwd: get_local(dialer).to_string(),
+            local_ufrag: get_local(dialer).to_string(),
             network_types: vec![
                 webrtc_ice::network_type::NetworkType::Udp4,
                 webrtc_ice::network_type::NetworkType::Udp6,
@@ -177,28 +175,33 @@ impl IceAgent {
         })
     }
 
-    async fn wait2(exchange: &mut CandidateExchange) -> DynResult<<Self as WaitThen>::Value> {
+    async fn wait2(
+        exchange: &mut CandidateExchange<S>,
+    ) -> IceResult<<Self as WaitThen>::Value, S::Error> {
         exchange.wait().await
     }
 
     async fn then2(
         agent: &Agent,
-        exchange: &mut CandidateExchange,
+        exchange: &mut CandidateExchange<S>,
         value: &mut <Self as WaitThen>::Value,
-    ) -> DynResult<()> {
+    ) -> IceResult<(), S::Error> {
         exchange.then(Some(agent), value).await
     }
 
-    pub async fn connect(&mut self) -> DynResult<Arc<dyn Conn + Send + Sync>> {
-        async fn do_connect(agent: &Agent, dialer: bool) -> DynResult<Arc<dyn Conn + Send + Sync>> {
+    pub async fn connect(&mut self) -> IceResult<Arc<dyn Conn + Send + Sync>, S::Error> {
+        async fn do_connect(
+            agent: &Agent,
+            dialer: bool,
+        ) -> Result<Arc<dyn Conn + Send + Sync>, webrtc_ice::Error> {
             let cancel = mpsc::channel(1);
             let r: Arc<dyn Conn + Send + Sync> = match dialer {
                 true => {
                     agent
                         .dial(
                             cancel.1,
-                            IceAgent::get_remote(dialer).to_string(),
-                            IceAgent::get_remote(dialer).to_string(),
+                            get_remote(dialer).to_string(),
+                            get_remote(dialer).to_string(),
                         )
                         .await?
                 }
@@ -206,8 +209,8 @@ impl IceAgent {
                     agent
                         .accept(
                             cancel.1,
-                            IceAgent::get_remote(dialer).to_string(),
-                            IceAgent::get_remote(dialer).to_string(),
+                            get_remote(dialer).to_string(),
+                            get_remote(dialer).to_string(),
                         )
                         .await?
                 }
@@ -215,7 +218,8 @@ impl IceAgent {
             Ok(r)
         }
 
-        let mut conn_ing = Box::pin(do_connect(&self.agent, self.dialer));
+        let conn_ing = do_connect(&self.agent, self.dialer);
+        pin_mut!(conn_ing);
         let net_conn = loop {
             let conn_ing = &mut conn_ing;
             select! {
@@ -232,20 +236,24 @@ impl IceAgent {
         Ok(net_conn)
     }
 }
-impl WaitThen for IceAgent {
-    type Value = CandidateExchangeValue;
+impl<S: Signalling> WaitThen for IceAgent<S> {
+    type Value = CandidateExchangeValue<S>;
     type Output = ();
+    type Error = IceError<S::Error>;
 
-    fn wait(&mut self) -> PinFutureLocal<'_, Self::Value> {
+    fn wait(&mut self) -> LocalBoxFuture<'_, IceResult<Self::Value, S::Error>> {
         Box::pin(async move { Self::wait2(&mut self.exchange).await })
     }
 
-    fn then<'a>(&'a mut self, value: &'a mut Self::Value) -> PinFutureLocal<'a, Self::Output> {
+    fn then<'a>(
+        &'a mut self,
+        value: &'a mut Self::Value,
+    ) -> LocalBoxFuture<'a, IceResult<Self::Output, S::Error>> {
         Box::pin(async move { Self::then2(&self.agent, &mut self.exchange, value).await })
     }
 }
-impl Control for IceAgent {
-    fn close(&mut self) -> PinFutureLocal<'_, ()> {
+impl<S: Signalling> Control for IceAgent<S> {
+    fn close(&mut self) -> LocalBoxFuture<'_, IceResult<(), S::Error>> {
         Box::pin(async move {
             self.exchange.close().await?;
             Ok(())
@@ -256,3 +264,43 @@ impl Control for IceAgent {
         self.exchange.rx_shut
     }
 }
+
+fn get_local(dialer: bool) -> &'static str {
+    if dialer {
+        "locallocallocallocal"
+    } else {
+        "remoteremoteremoteremote"
+    }
+}
+
+fn get_remote(dialer: bool) -> &'static str {
+    get_local(!dialer)
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum IceError<E: std::error::Error> {
+    #[error(transparent)]
+    SignalingError(E),
+    #[error("Bad handshake, expected {expected:?} but got {0:?}", expected=PROTOCOL_START)]
+    BadHandshake(String),
+    #[error(transparent)]
+    IceError(#[from] webrtc_ice::Error),
+}
+impl<E: std::error::Error + IntoIoError> IntoIoError for IceError<E> {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            IceError::SignalingError(e) => e.kind(),
+            IceError::BadHandshake(_) => io::ErrorKind::InvalidData,
+            IceError::IceError(_) => io::ErrorKind::Other,
+        }
+    }
+}
+impl<E: std::error::Error + IntoIoError> From<IceError<E>> for io::Error {
+    fn from(value: IceError<E>) -> Self {
+        match value {
+            IceError::SignalingError(e) => e.into(),
+            e => io::Error::new(e.kind(), e),
+        }
+    }
+}
+pub type IceResult<T, E> = Result<T, IceError<E>>;

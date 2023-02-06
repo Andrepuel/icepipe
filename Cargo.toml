@@ -1,6 +1,6 @@
 [package]
 name = "icepipe"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license-file = "LICENSE"
 description = "Peer to Peer communication encrypted using WebRTC"
@@ -11,7 +11,6 @@ keywords = ["socket", "sctp", "udp"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0"
 base64 = "0.21"
 bytes = "1.4"
 clap = { version = "4.1", features = ["derive"] }
@@ -19,6 +18,7 @@ env_logger = "0.10"
 futures = "0.3"
 log = "0.4"
 ring = "0.16.20"
+thiserror = "1.0.38"
 tokio = "1.25"
 tokio-tungstenite = { version = "0.18", features = [
     "rustls-tls-native-roots",

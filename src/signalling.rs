@@ -1,5 +1,6 @@
-use crate::{pipe_stream::WaitThenDyn, PinFuture};
+use crate::pipe_stream::WaitThen;
+use futures::future::BoxFuture;
 
-pub trait Signalling: WaitThenDyn<Output = Option<String>> {
-    fn send(&mut self, candidates: String) -> PinFuture<'_, ()>;
+pub trait Signalling: WaitThen<Output = Option<String>> {
+    fn send(&mut self, candidates: String) -> BoxFuture<'_, Result<(), Self::Error>>;
 }

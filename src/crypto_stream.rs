@@ -1,8 +1,13 @@
+use std::io;
+
 use crate::{
     pipe_stream::{Control, PipeStream, WaitThen},
-    DynResult, PinFutureLocal,
+    IntoIoError,
 };
-use futures::future::ready;
+use futures::{
+    future::{ready, LocalBoxFuture},
+    FutureExt,
+};
 use ring::{
     aead::{
         Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, CHACHA20_POLY1305,
@@ -10,7 +15,6 @@ use ring::{
     error::Unspecified,
     hkdf::{self, KeyType},
 };
-use std::any::Any;
 
 pub struct Sequential(u128);
 impl NonceSequence for Sequential {
@@ -25,25 +29,18 @@ impl NonceSequence for Sequential {
     }
 }
 
-pub trait RingError<T>: Into<Result<T, Unspecified>> {
-    fn ring_err(self) -> DynResult<T> {
-        self.into().map_err(|_| anyhow::anyhow!("Crypto error"))
-    }
-}
-impl<T> RingError<T> for Result<T, Unspecified> {}
-
 impl hkdf::KeyType for Sequential {
     fn len(&self) -> usize {
         16
     }
 }
 
-pub struct Chacha20Stream {
+pub struct Chacha20Stream<S: PipeStream> {
     sealing_key: SealingKey<Sequential>,
     opening_key: OpeningKey<Sequential>,
-    underlying: Box<dyn PipeStream>,
+    underlying: S,
 }
-impl Chacha20Stream {
+impl<S: PipeStream> Chacha20Stream<S> {
     pub fn derive<L: KeyType>(
         basekey: &[u8],
         dialer: bool,
@@ -63,11 +60,11 @@ impl Chacha20Stream {
         okm.fill(out).unwrap();
     }
 
-    fn get_key(basekey: &[u8], dialer: bool) -> DynResult<UnboundKey> {
+    fn get_key(basekey: &[u8], dialer: bool) -> Chacha20Result<UnboundKey, S::Error> {
         let mut key_bytes = [0; 32];
         Self::derive(basekey, dialer, "key", &CHACHA20_POLY1305, &mut key_bytes);
 
-        UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).ring_err()
+        UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).map_err(Chacha20Error::CryptoError)
     }
 
     fn get_seq(basekey: &[u8], dialer: bool) -> Sequential {
@@ -77,19 +74,7 @@ impl Chacha20Stream {
         Sequential(u128::from_be_bytes(u128_be))
     }
 
-    pub fn new<T: PipeStream + 'static>(
-        basekey: &[u8],
-        dialer: bool,
-        underlying: T,
-    ) -> DynResult<Chacha20Stream> {
-        Self::new_dyn(basekey, dialer, Box::new(underlying))
-    }
-
-    pub fn new_dyn(
-        basekey: &[u8],
-        dialer: bool,
-        underlying: Box<dyn PipeStream>,
-    ) -> DynResult<Chacha20Stream> {
+    pub fn new(basekey: &[u8], dialer: bool, underlying: S) -> Chacha20Result<Self, S::Error> {
         let sealing = Self::get_key(basekey, dialer)?;
         let sealing_seq = Self::get_seq(basekey, dialer);
         let opening = Self::get_key(basekey, !dialer)?;
@@ -104,37 +89,41 @@ impl Chacha20Stream {
         })
     }
 }
-impl PipeStream for Chacha20Stream {
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> PinFutureLocal<'a, ()> {
+impl<S: PipeStream> PipeStream for Chacha20Stream<S> {
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, Chacha20Result<(), S::Error>> {
         let mut data = data.to_owned();
 
         if let Err(e) = self
             .sealing_key
             .seal_in_place_append_tag(Aad::empty(), &mut data)
-            .ring_err()
+            .map_err(Chacha20Error::CryptoError)
         {
             return Box::pin(ready(Err(e)));
         }
 
-        Box::pin(async move { self.underlying.send(&data).await })
+        async move { Ok(self.underlying.send(&data).await?) }.boxed_local()
     }
 }
-impl WaitThen for Chacha20Stream {
-    type Value = Box<dyn Any>;
+impl<S: PipeStream> WaitThen for Chacha20Stream<S> {
+    type Value = S::Value;
     type Output = Option<Vec<u8>>;
+    type Error = Chacha20Error<S::Error>;
 
-    fn wait(&mut self) -> PinFutureLocal<'_, Self::Value> {
-        self.underlying.wait_dyn()
+    fn wait(&mut self) -> LocalBoxFuture<'_, Chacha20Result<Self::Value, S::Error>> {
+        async move { Ok(self.underlying.wait().await?) }.boxed_local()
     }
 
-    fn then<'a>(&'a mut self, value: &'a mut Self::Value) -> PinFutureLocal<'a, Self::Output> {
+    fn then<'a>(
+        &'a mut self,
+        value: &'a mut Self::Value,
+    ) -> LocalBoxFuture<'a, Chacha20Result<Self::Output, S::Error>> {
         Box::pin(async move {
-            let mut data: Option<Vec<u8>> = self.underlying.then_dyn(value).await?;
+            let mut data: Option<Vec<u8>> = self.underlying.then(value).await?;
             let r = match data.as_mut() {
                 Some(data) => Some(
                     self.opening_key
                         .open_in_place(Aad::empty(), data)
-                        .ring_err()?
+                        .map_err(Chacha20Error::CryptoError)?
                         .to_owned(),
                 ),
                 None => None,
@@ -144,12 +133,37 @@ impl WaitThen for Chacha20Stream {
         })
     }
 }
-impl Control for Chacha20Stream {
-    fn close(&mut self) -> PinFutureLocal<'_, ()> {
-        self.underlying.close()
+impl<S: PipeStream> Control for Chacha20Stream<S> {
+    fn close(&mut self) -> LocalBoxFuture<'_, Chacha20Result<(), S::Error>> {
+        async move { Ok(self.underlying.close().await?) }.boxed_local()
     }
 
     fn rx_closed(&self) -> bool {
         self.underlying.rx_closed()
     }
 }
+
+#[derive(thiserror::Error, Debug)]
+pub enum Chacha20Error<E: std::error::Error> {
+    #[error(transparent)]
+    StreamError(#[from] E),
+    #[error("Crypto error")]
+    CryptoError(Unspecified),
+}
+impl<E: std::error::Error + IntoIoError> IntoIoError for Chacha20Error<E> {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Chacha20Error::StreamError(e) => e.kind(),
+            Chacha20Error::CryptoError(_) => io::ErrorKind::Other,
+        }
+    }
+}
+impl<E: std::error::Error + IntoIoError> From<Chacha20Error<E>> for io::Error {
+    fn from(value: Chacha20Error<E>) -> Self {
+        match value {
+            Chacha20Error::StreamError(e) => e.into(),
+            e => io::Error::new(e.kind(), e),
+        }
+    }
+}
+pub type Chacha20Result<T, E> = Result<T, Chacha20Error<E>>;

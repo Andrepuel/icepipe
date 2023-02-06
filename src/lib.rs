@@ -9,11 +9,8 @@ pub mod sctp;
 pub mod signalling;
 pub mod ws;
 
-use std::future::Future;
-use std::pin::Pin;
-
-pub type DynResult<T> = Result<T, anyhow::Error>;
-pub type PinFuture<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + Send + 'a>>;
-pub type PinFutureLocal<'a, T> = Pin<Box<dyn Future<Output = DynResult<T>> + 'a>>;
-
 pub use connect::connect;
+
+pub trait IntoIoError: Into<std::io::Error> + Send + Sync + 'static {
+    fn kind(&self) -> std::io::ErrorKind;
+}

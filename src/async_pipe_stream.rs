@@ -1,6 +1,9 @@
 use crate::pipe_stream::{Control, PipeStream, WaitThen};
-use futures::future::ready;
-use std::pin::Pin;
+use futures::{
+    future::{ready, LocalBoxFuture},
+    FutureExt,
+};
+use std::{io, pin::Pin};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub type DynAsyncRead = Pin<Box<dyn AsyncRead>>;
@@ -38,30 +41,33 @@ impl AsyncPipeStream {
     }
 }
 impl PipeStream for AsyncPipeStream {
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> crate::PinFutureLocal<'a, ()> {
-        Box::pin(async move {
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, io::Result<()>> {
+        async move {
             self.output.write_all(data).await?;
             self.output.flush().await?;
             Ok(())
-        })
+        }
+        .boxed_local()
     }
 }
 impl WaitThen for AsyncPipeStream {
     type Value = usize;
     type Output = Option<Vec<u8>>;
+    type Error = io::Error;
 
-    fn wait(&mut self) -> crate::PinFutureLocal<'_, Self::Value> {
+    fn wait(&mut self) -> LocalBoxFuture<'_, io::Result<Self::Value>> {
         self.buf.resize(4096, 0);
-        Box::pin(async move {
+        async move {
             let n = self.input.read(&mut self.buf).await?;
             Ok(n)
-        })
+        }
+        .boxed_local()
     }
 
     fn then<'a>(
         &'a mut self,
         value: &'a mut Self::Value,
-    ) -> crate::PinFutureLocal<'a, Self::Output> {
+    ) -> LocalBoxFuture<'a, io::Result<Self::Output>> {
         if *value == 0 {
             self.rx_shut = true;
             return Box::pin(ready(Ok(None)));
@@ -73,11 +79,12 @@ impl WaitThen for AsyncPipeStream {
     }
 }
 impl Control for AsyncPipeStream {
-    fn close(&mut self) -> crate::PinFutureLocal<'_, ()> {
-        Box::pin(async move {
+    fn close(&mut self) -> LocalBoxFuture<'_, io::Result<()>> {
+        async move {
             self.output.shutdown().await?;
             Ok(())
-        })
+        }
+        .boxed_local()
     }
 
     fn rx_closed(&self) -> bool {
