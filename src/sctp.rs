@@ -1,6 +1,7 @@
 use crate::{
-    pipe_stream::{Control, PipeStream, WaitThen},
-    IntoIoError,
+    error::TimeoutError,
+    pipe_stream::{Control, PipeStream, StreamError, WaitThen},
+    signalling::SignalingError,
 };
 use bytes::Bytes;
 use futures::{
@@ -14,18 +15,26 @@ use webrtc_sctp::{
 };
 use webrtc_util::Conn;
 
-pub struct Sctp<C: Control> {
+pub struct Sctp<C>
+where
+    C: Control,
+    C::Error: Into<StreamError>,
+{
     _association: Association,
     stream: Arc<Stream>,
     buf: Vec<u8>,
     underlying: C,
 }
-impl<C: Control> Sctp<C> {
+impl<C> Sctp<C>
+where
+    C: Control,
+    C::Error: Into<StreamError>,
+{
     pub async fn new(
         net_conn: Arc<dyn Conn + Send + Sync>,
         dialer: bool,
         underlying: C,
-    ) -> SctpResult<Self, C::Error> {
+    ) -> SctpResult<Self> {
         let config = webrtc_sctp::association::Config {
             net_conn,
             max_receive_buffer_size: 4 * 1024 * 1024,
@@ -65,8 +74,12 @@ impl<C: Control> Sctp<C> {
         })
     }
 }
-impl<C: Control> PipeStream for Sctp<C> {
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, SctpResult<(), C::Error>> {
+impl<C> PipeStream for Sctp<C>
+where
+    C: Control,
+    C::Error: Into<StreamError>,
+{
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, SctpResult<()>> {
         async move {
             self.stream
                 .write_sctp(&data.to_owned().into(), PayloadProtocolIdentifier::Binary)?;
@@ -79,18 +92,22 @@ impl<C: Control> PipeStream for Sctp<C> {
         .boxed_local()
     }
 }
-impl<C: Control> WaitThen for Sctp<C> {
+impl<C> WaitThen for Sctp<C>
+where
+    C: Control,
+    C::Error: Into<StreamError>,
+{
     type Value = Either<C::Value, (usize, PayloadProtocolIdentifier)>;
     type Output = Option<Vec<u8>>;
-    type Error = SctpError<C::Error>;
+    type Error = SctpError;
 
-    fn wait(&mut self) -> LocalBoxFuture<'_, SctpResult<Self::Value, C::Error>> {
+    fn wait(&mut self) -> LocalBoxFuture<'_, SctpResult<Self::Value>> {
         self.buf.resize(8096, 0);
 
         Box::pin(async move {
             let r = select! {
                 value = self.underlying.wait() => {
-                    Either::Left(value.map_err(SctpError::ControlError)?)
+                    Either::Left(value.map_err(Into::into)?)
                 },
                 r = self.stream.read_sctp(&mut self.buf[..]) => {
                     let (n, protocol_id) = r?;
@@ -104,12 +121,12 @@ impl<C: Control> WaitThen for Sctp<C> {
     fn then<'a>(
         &'a mut self,
         value: &'a mut Self::Value,
-    ) -> LocalBoxFuture<'a, SctpResult<Self::Output, C::Error>> {
+    ) -> LocalBoxFuture<'a, SctpResult<Self::Output>> {
         match value {
             Either::Left(x) => {
                 let r = self.underlying.then(x);
                 Box::pin(async move {
-                    r.await.map_err(SctpError::ControlError)?;
+                    r.await.map_err(Into::into)?;
                     Ok(None)
                 })
             }
@@ -124,18 +141,19 @@ impl<C: Control> WaitThen for Sctp<C> {
         }
     }
 }
-impl<C: Control> Control for Sctp<C> {
-    fn close(&mut self) -> LocalBoxFuture<'_, SctpResult<(), C::Error>> {
+impl<C> Control for Sctp<C>
+where
+    C: Control,
+    C::Error: Into<StreamError>,
+{
+    fn close(&mut self) -> LocalBoxFuture<'_, SctpResult<()>> {
         async move {
             while self.stream.buffered_amount() > 0 {
                 sleep(Duration::from_millis(100)).await;
             }
             sleep(Duration::from_millis(100)).await;
 
-            self.underlying
-                .close()
-                .await
-                .map_err(SctpError::ControlError)?;
+            self.underlying.close().await.map_err(Into::into)?;
             self.stream.shutdown(std::net::Shutdown::Both).await?;
 
             Ok(())
@@ -149,30 +167,49 @@ impl<C: Control> Control for Sctp<C> {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum SctpError<E: std::error::Error> {
+pub enum SctpError {
     #[error(transparent)]
-    ControlError(E),
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Timeout(#[from] TimeoutError),
+    #[error(transparent)]
+    SignalingError(SignalingError),
+    #[error(transparent)]
+    StreamError(StreamError),
     #[error("Association closed when waiting for stream")]
     AssociationClosedWithoutStream,
     #[error(transparent)]
     WebrtcSctpError(#[from] webrtc_sctp::Error),
 }
-impl<E: std::error::Error + IntoIoError> IntoIoError for SctpError<E> {
-    fn kind(&self) -> io::ErrorKind {
-        match self {
-            SctpError::ControlError(e) => e.kind(),
-            SctpError::AssociationClosedWithoutStream => io::ErrorKind::ConnectionReset,
-            SctpError::WebrtcSctpError(_) => io::ErrorKind::Other,
-        }
-    }
-}
-impl<E: std::error::Error + IntoIoError> From<SctpError<E>> for io::Error {
-    fn from(value: SctpError<E>) -> Self {
+impl From<SignalingError> for SctpError {
+    fn from(value: SignalingError) -> Self {
         match value {
-            SctpError::ControlError(e) => e.into(),
-            e => io::Error::new(e.kind(), e),
+            SignalingError::Io(e) => e.into(),
+            SignalingError::Timeout(e) => e.into(),
+            e => Self::SignalingError(e),
         }
     }
 }
-
-pub type SctpResult<T, E> = Result<T, SctpError<E>>;
+impl From<StreamError> for SctpError {
+    fn from(value: StreamError) -> Self {
+        match value {
+            StreamError::Io(e) => e.into(),
+            StreamError::Timeout(e) => e.into(),
+            StreamError::SignalingError(e) => e.into(),
+            e @ StreamError::Other(_) => Self::StreamError(e),
+        }
+    }
+}
+impl From<SctpError> for StreamError {
+    fn from(value: SctpError) -> Self {
+        match value {
+            SctpError::Io(e) => e.into(),
+            SctpError::Timeout(e) => e.into(),
+            SctpError::SignalingError(e) => e.into(),
+            SctpError::StreamError(e) => e,
+            e @ SctpError::AssociationClosedWithoutStream => StreamError::Other(Box::new(e)),
+            e @ SctpError::WebrtcSctpError(_) => StreamError::Other(Box::new(e)),
+        }
+    }
+}
+pub type SctpResult<T> = Result<T, SctpError>;

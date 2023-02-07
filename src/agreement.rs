@@ -1,4 +1,7 @@
-use crate::{signalling::Signalling, IntoIoError};
+use crate::{
+    error::TimeoutError,
+    signalling::{SignalingError, Signalling},
+};
 use base64::{
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
     Engine,
@@ -6,12 +9,20 @@ use base64::{
 use ring::{agreement, hmac, pbkdf2, rand::SystemRandom};
 use std::{io, num::NonZeroU32};
 
-pub struct Agreement<T: Signalling> {
+pub struct Agreement<T>
+where
+    T: Signalling,
+    T::Error: Into<SignalingError>,
+{
     signalling: T,
     psk: String,
     dialer: bool,
 }
-impl<T: Signalling> Agreement<T> {
+impl<T> Agreement<T>
+where
+    T: Signalling,
+    T::Error: Into<SignalingError>,
+{
     pub fn derive(basekey: &str, dialer: bool, salt: &str, out: &mut [u8]) {
         let salt = format!(
             "{}:{}",
@@ -48,23 +59,19 @@ impl<T: Signalling> Agreement<T> {
         }
     }
 
-    pub async fn agree(mut self) -> AgreementResult<(Vec<u8>, T), T::Error> {
+    pub async fn agree(mut self) -> AgreementResult<(Vec<u8>, T)> {
         let rng = SystemRandom::new();
-        let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
-            .map_err(AgreementError::CryptoError)?;
-        let my_public_key = my_private_key
-            .compute_public_key()
-            .map_err(AgreementError::CryptoError)?;
+        let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)?;
+        let my_public_key = my_private_key.compute_public_key()?;
 
         self.signalling
             .send(BASE64_STANDARD.encode(&my_public_key))
-            .await?;
+            .await
+            .map_err(Into::into)?;
         let peer_public_key = self.signalling_recv().await?;
         let peer_public_key = agreement::UnparsedPublicKey::new(
             &agreement::X25519,
-            BASE64_STANDARD
-                .decode(&peer_public_key)
-                .map_err(AgreementError::Base64Error)?,
+            BASE64_STANDARD.decode(&peer_public_key)?,
         );
 
         let key_material = agreement::agree_ephemeral(
@@ -72,21 +79,17 @@ impl<T: Signalling> Agreement<T> {
             &peer_public_key,
             ring::error::Unspecified,
             |key_material| Ok(key_material.to_owned()),
-        )
-        .map_err(AgreementError::CryptoError)?;
+        )?;
 
         let auth_tx = self.key_material_check_tag(&key_material, self.dialer);
         let auth_rx = self.key_material_check_tag(&key_material, !self.dialer);
 
         self.signalling
             .send(BASE64_STANDARD.encode(auth_tx))
-            .await?;
+            .await
+            .map_err(Into::into)?;
         let auth_rx_rx = self.signalling_recv().await?;
-        if auth_rx.as_ref()
-            != BASE64_STANDARD
-                .decode(auth_rx_rx)
-                .map_err(AgreementError::Base64Error)?
-        {
+        if auth_rx.as_ref() != BASE64_STANDARD.decode(auth_rx_rx)? {
             return Err(AgreementError::TagMismatch);
         }
 
@@ -101,10 +104,10 @@ impl<T: Signalling> Agreement<T> {
         hmac::sign(&key, key_material)
     }
 
-    async fn signalling_recv(&mut self) -> AgreementResult<String, T::Error> {
+    async fn signalling_recv(&mut self) -> AgreementResult<String> {
         loop {
-            let mut value = self.signalling.wait().await?;
-            let then = self.signalling.then(&mut value).await?;
+            let mut value = self.signalling.wait().await.map_err(Into::into)?;
+            let then = self.signalling.then(&mut value).await.map_err(Into::into)?;
             match then {
                 Some(key) => break Ok(key),
                 None => continue,
@@ -114,32 +117,32 @@ impl<T: Signalling> Agreement<T> {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum AgreementError<E: std::error::Error> {
+pub enum AgreementError {
     #[error(transparent)]
-    SignalingError(#[from] E),
+    Io(#[from] io::Error),
     #[error(transparent)]
-    Base64Error(base64::DecodeError),
+    Timeout(#[from] TimeoutError),
+    #[error(transparent)]
+    SignalingError(SignalingError),
+    #[error(transparent)]
+    Base64Error(#[from] base64::DecodeError),
     #[error("Crypto error")]
     CryptoError(ring::error::Unspecified),
     #[error("Mismatch authentication tag on key agreement based on PSK")]
     TagMismatch,
 }
-impl<E: std::error::Error + IntoIoError> IntoIoError for AgreementError<E> {
-    fn kind(&self) -> io::ErrorKind {
-        match self {
-            AgreementError::SignalingError(e) => e.kind(),
-            AgreementError::Base64Error(_) => io::ErrorKind::InvalidData,
-            AgreementError::CryptoError(_) => io::ErrorKind::Other,
-            AgreementError::TagMismatch => io::ErrorKind::InvalidData,
-        }
-    }
-}
-impl<E: std::error::Error + IntoIoError> From<AgreementError<E>> for io::Error {
-    fn from(value: AgreementError<E>) -> Self {
+impl From<SignalingError> for AgreementError {
+    fn from(value: SignalingError) -> Self {
         match value {
-            AgreementError::SignalingError(e) => e.into(),
-            e => io::Error::new(e.kind(), e),
+            SignalingError::Timeout(e) => e.into(),
+            SignalingError::Io(e) => e.into(),
+            e => Self::SignalingError(e),
         }
     }
 }
-pub type AgreementResult<T, E> = Result<T, AgreementError<E>>;
+impl From<ring::error::Unspecified> for AgreementError {
+    fn from(value: ring::error::Unspecified) -> Self {
+        Self::CryptoError(value)
+    }
+}
+pub type AgreementResult<T> = Result<T, AgreementError>;

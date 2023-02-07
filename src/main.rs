@@ -1,15 +1,15 @@
 use clap::Parser;
 use icepipe::{
     async_pipe_stream::{AsyncPipeStream, DynAsyncRead, DynAsyncWrite},
-    pipe_stream::{Control, PipeStream, WaitThen},
+    pipe_stream::{Control, PipeStream, StreamResult, WaitThen},
 };
-use std::{io, process};
+use std::process;
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
 };
 
-fn main() -> io::Result<()> {
+fn main() -> StreamResult<()> {
     env_logger::init();
 
     tokio::runtime::Builder::new_multi_thread()
@@ -49,7 +49,7 @@ struct Args {
     tcp_forward: Option<String>,
 }
 
-async fn main2() -> io::Result<()> {
+async fn main2() -> StreamResult<()> {
     let args = Args::parse();
 
     let mut peer_stream =

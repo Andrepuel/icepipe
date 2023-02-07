@@ -1,8 +1,7 @@
-use std::io;
-
 use crate::{
-    pipe_stream::{Control, PipeStream, WaitThen},
-    IntoIoError,
+    error::TimeoutError,
+    pipe_stream::{Control, PipeStream, StreamError, WaitThen},
+    signalling::SignalingError,
 };
 use futures::{
     future::{ready, LocalBoxFuture},
@@ -15,6 +14,7 @@ use ring::{
     error::Unspecified,
     hkdf::{self, KeyType},
 };
+use std::io;
 
 pub struct Sequential(u128);
 impl NonceSequence for Sequential {
@@ -35,12 +35,20 @@ impl hkdf::KeyType for Sequential {
     }
 }
 
-pub struct Chacha20Stream<S: PipeStream> {
+pub struct Chacha20Stream<S>
+where
+    S: PipeStream,
+    S::Error: Into<StreamError>,
+{
     sealing_key: SealingKey<Sequential>,
     opening_key: OpeningKey<Sequential>,
     underlying: S,
 }
-impl<S: PipeStream> Chacha20Stream<S> {
+impl<S> Chacha20Stream<S>
+where
+    S: PipeStream,
+    S::Error: Into<StreamError>,
+{
     pub fn derive<L: KeyType>(
         basekey: &[u8],
         dialer: bool,
@@ -60,7 +68,7 @@ impl<S: PipeStream> Chacha20Stream<S> {
         okm.fill(out).unwrap();
     }
 
-    fn get_key(basekey: &[u8], dialer: bool) -> Chacha20Result<UnboundKey, S::Error> {
+    fn get_key(basekey: &[u8], dialer: bool) -> Chacha20Result<UnboundKey> {
         let mut key_bytes = [0; 32];
         Self::derive(basekey, dialer, "key", &CHACHA20_POLY1305, &mut key_bytes);
 
@@ -74,7 +82,7 @@ impl<S: PipeStream> Chacha20Stream<S> {
         Sequential(u128::from_be_bytes(u128_be))
     }
 
-    pub fn new(basekey: &[u8], dialer: bool, underlying: S) -> Chacha20Result<Self, S::Error> {
+    pub fn new(basekey: &[u8], dialer: bool, underlying: S) -> Chacha20Result<Self> {
         let sealing = Self::get_key(basekey, dialer)?;
         let sealing_seq = Self::get_seq(basekey, dialer);
         let opening = Self::get_key(basekey, !dialer)?;
@@ -89,8 +97,12 @@ impl<S: PipeStream> Chacha20Stream<S> {
         })
     }
 }
-impl<S: PipeStream> PipeStream for Chacha20Stream<S> {
-    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, Chacha20Result<(), S::Error>> {
+impl<S> PipeStream for Chacha20Stream<S>
+where
+    S: PipeStream,
+    S::Error: Into<StreamError>,
+{
+    fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, Chacha20Result<()>> {
         let mut data = data.to_owned();
 
         if let Err(e) = self
@@ -101,24 +113,29 @@ impl<S: PipeStream> PipeStream for Chacha20Stream<S> {
             return Box::pin(ready(Err(e)));
         }
 
-        async move { Ok(self.underlying.send(&data).await?) }.boxed_local()
+        async move { Ok(self.underlying.send(&data).await.map_err(Into::into)?) }.boxed_local()
     }
 }
-impl<S: PipeStream> WaitThen for Chacha20Stream<S> {
+impl<S> WaitThen for Chacha20Stream<S>
+where
+    S: PipeStream,
+    S::Error: Into<StreamError>,
+{
     type Value = S::Value;
     type Output = Option<Vec<u8>>;
-    type Error = Chacha20Error<S::Error>;
+    type Error = Chacha20Error;
 
-    fn wait(&mut self) -> LocalBoxFuture<'_, Chacha20Result<Self::Value, S::Error>> {
-        async move { Ok(self.underlying.wait().await?) }.boxed_local()
+    fn wait(&mut self) -> LocalBoxFuture<'_, Chacha20Result<Self::Value>> {
+        async move { Ok(self.underlying.wait().await.map_err(Into::into)?) }.boxed_local()
     }
 
     fn then<'a>(
         &'a mut self,
         value: &'a mut Self::Value,
-    ) -> LocalBoxFuture<'a, Chacha20Result<Self::Output, S::Error>> {
+    ) -> LocalBoxFuture<'a, Chacha20Result<Self::Output>> {
         Box::pin(async move {
-            let mut data: Option<Vec<u8>> = self.underlying.then(value).await?;
+            let mut data: Option<Vec<u8>> =
+                self.underlying.then(value).await.map_err(Into::into)?;
             let r = match data.as_mut() {
                 Some(data) => Some(
                     self.opening_key
@@ -133,9 +150,13 @@ impl<S: PipeStream> WaitThen for Chacha20Stream<S> {
         })
     }
 }
-impl<S: PipeStream> Control for Chacha20Stream<S> {
-    fn close(&mut self) -> LocalBoxFuture<'_, Chacha20Result<(), S::Error>> {
-        async move { Ok(self.underlying.close().await?) }.boxed_local()
+impl<S> Control for Chacha20Stream<S>
+where
+    S: PipeStream,
+    S::Error: Into<StreamError>,
+{
+    fn close(&mut self) -> LocalBoxFuture<'_, Chacha20Result<()>> {
+        async move { Ok(self.underlying.close().await.map_err(Into::into)?) }.boxed_local()
     }
 
     fn rx_closed(&self) -> bool {
@@ -144,26 +165,47 @@ impl<S: PipeStream> Control for Chacha20Stream<S> {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum Chacha20Error<E: std::error::Error> {
+pub enum Chacha20Error {
     #[error(transparent)]
-    StreamError(#[from] E),
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Timeout(#[from] TimeoutError),
+    #[error(transparent)]
+    SignalingError(SignalingError),
+    #[error(transparent)]
+    StreamError(StreamError),
     #[error("Crypto error")]
     CryptoError(Unspecified),
 }
-impl<E: std::error::Error + IntoIoError> IntoIoError for Chacha20Error<E> {
-    fn kind(&self) -> io::ErrorKind {
-        match self {
-            Chacha20Error::StreamError(e) => e.kind(),
-            Chacha20Error::CryptoError(_) => io::ErrorKind::Other,
-        }
-    }
-}
-impl<E: std::error::Error + IntoIoError> From<Chacha20Error<E>> for io::Error {
-    fn from(value: Chacha20Error<E>) -> Self {
+impl From<SignalingError> for Chacha20Error {
+    fn from(value: SignalingError) -> Self {
         match value {
-            Chacha20Error::StreamError(e) => e.into(),
-            e => io::Error::new(e.kind(), e),
+            SignalingError::Io(e) => e.into(),
+            SignalingError::Timeout(e) => e.into(),
+            e @ SignalingError::ProtocolError(_) => Self::SignalingError(e),
         }
     }
 }
-pub type Chacha20Result<T, E> = Result<T, Chacha20Error<E>>;
+impl From<StreamError> for Chacha20Error {
+    fn from(value: StreamError) -> Self {
+        match value {
+            StreamError::Io(e) => e.into(),
+            StreamError::Timeout(e) => e.into(),
+            StreamError::SignalingError(e) => e.into(),
+            e @ StreamError::Other(_) => Self::StreamError(e),
+        }
+    }
+}
+pub type Chacha20Result<T> = Result<T, Chacha20Error>;
+
+impl From<Chacha20Error> for StreamError {
+    fn from(value: Chacha20Error) -> Self {
+        match value {
+            Chacha20Error::Io(e) => e.into(),
+            Chacha20Error::Timeout(e) => e.into(),
+            Chacha20Error::SignalingError(e) => e.into(),
+            Chacha20Error::StreamError(e) => e,
+            e @ Chacha20Error::CryptoError(_) => Self::Other(Box::new(e)),
+        }
+    }
+}

@@ -1,10 +1,11 @@
-use crate::{pipe_stream::WaitThen, signalling::Signalling, IntoIoError};
-use futures::{
-    future::{BoxFuture, LocalBoxFuture},
-    FutureExt, SinkExt, StreamExt,
+use crate::{
+    error::TimeoutError,
+    pipe_stream::WaitThen,
+    signalling::{SignalingError, Signalling},
 };
+use futures::{future::LocalBoxFuture, FutureExt, SinkExt, StreamExt};
 use std::{
-    io::ErrorKind,
+    io,
     time::{Duration, Instant},
 };
 use tokio::{net::TcpStream, select, time::sleep_until};
@@ -52,7 +53,7 @@ impl Websocket {
     }
 }
 impl Signalling for Websocket {
-    fn send(&mut self, msg: String) -> BoxFuture<WebsocketResult<()>> {
+    fn send(&mut self, msg: String) -> LocalBoxFuture<WebsocketResult<()>> {
         Box::pin(async move {
             self.ws.send(Message::Text(msg)).await?;
 
@@ -68,7 +69,7 @@ impl WaitThen for Websocket {
     fn wait(&mut self) -> LocalBoxFuture<'_, WebsocketResult<Self::Value>> {
         let next_ping = self.last_ping + Duration::from_secs(15);
         let pong_timeout = self.last_pong + Duration::from_secs(60);
-        Box::pin(async move {
+        async move {
             select! {
                 msg = self.ws.next() => {
                     let msg = msg.ok_or(TungsteniteError::ConnectionClosed)??;
@@ -78,10 +79,11 @@ impl WaitThen for Websocket {
                     Ok(WebsocketValue::Ping)
                 }
                 _ = sleep_until(pong_timeout.into()) => {
-                    Err(WebsocketError::Timeout)
+                    Err(TimeoutError.into())
                 }
             }
-        })
+        }
+        .boxed_local()
     }
 
     fn then<'a>(
@@ -136,32 +138,56 @@ pub enum WebsocketError {
     #[error(transparent)]
     WebsocketError(#[from] TungsteniteError),
     #[error("Ping timeout")]
-    Timeout,
+    Timeout(#[from] TimeoutError),
 }
-impl IntoIoError for WebsocketError {
-    fn kind(&self) -> ErrorKind {
-        match self {
-            WebsocketError::ProtocolError(_) => ErrorKind::InvalidData,
-            WebsocketError::WebsocketError(_) => ErrorKind::BrokenPipe,
-            WebsocketError::Timeout => ErrorKind::TimedOut,
-        }
-    }
-}
-impl From<WebsocketError> for std::io::Error {
+impl From<WebsocketError> for SignalingError {
     fn from(value: WebsocketError) -> Self {
         match value {
-            WebsocketError::WebsocketError(TungsteniteError::Io(e)) => e,
-            e => std::io::Error::new(e.kind(), e),
+            WebsocketError::ProtocolError(e) => e.into(),
+            WebsocketError::WebsocketError(e) => e.into(),
+            WebsocketError::Timeout(e) => e.into(),
         }
     }
 }
 pub type WebsocketResult<T> = Result<T, WebsocketError>;
 pub type TungsteniteError = tokio_tungstenite::tungstenite::Error;
+impl From<TungsteniteError> for SignalingError {
+    fn from(value: TungsteniteError) -> Self {
+        match value {
+            e @ TungsteniteError::ConnectionClosed => {
+                io::Error::new(io::ErrorKind::ConnectionReset, e).into()
+            }
+            e @ TungsteniteError::AlreadyClosed => {
+                io::Error::new(io::ErrorKind::ConnectionReset, e).into()
+            }
+            TungsteniteError::Io(e) => e.into(),
+            e @ TungsteniteError::Tls(_) => io::Error::new(io::ErrorKind::Other, e).into(),
+            e @ TungsteniteError::Capacity(_) => {
+                io::Error::new(io::ErrorKind::OutOfMemory, e).into()
+            }
+            e @ TungsteniteError::Protocol(_) => SignalingError::ProtocolError(Box::new(e)),
+            e @ TungsteniteError::SendQueueFull(_) => {
+                io::Error::new(io::ErrorKind::OutOfMemory, e).into()
+            }
+            e @ TungsteniteError::Utf8 => io::Error::new(io::ErrorKind::InvalidData, e).into(),
+            e @ TungsteniteError::Url(_) => io::Error::new(io::ErrorKind::InvalidInput, e).into(),
+            e @ TungsteniteError::Http(_) => io::Error::new(io::ErrorKind::InvalidData, e).into(),
+            e @ TungsteniteError::HttpFormat(_) => {
+                io::Error::new(io::ErrorKind::InvalidData, e).into()
+            }
+        }
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProtocolError {
     #[error("Expected {0:?} but got {0:?}")]
     Unexpected(Message, Expected),
+}
+impl From<ProtocolError> for SignalingError {
+    fn from(value: ProtocolError) -> Self {
+        SignalingError::ProtocolError(Box::new(value))
+    }
 }
 
 #[derive(Debug)]

@@ -2,11 +2,12 @@ use crate::{
     agreement::{Agreement, AgreementError},
     constants,
     crypto_stream::{Chacha20Error, Chacha20Stream},
+    error::TimeoutError,
     ice::{IceAgent, IceError},
-    pipe_stream::WaitThen,
+    pipe_stream::StreamError,
     sctp::{Sctp, SctpError},
+    signalling::SignalingError,
     ws::Websocket,
-    IntoIoError,
 };
 use std::{io, str::FromStr};
 
@@ -44,9 +45,7 @@ pub async fn connect(
     let channel = Agreement::<Websocket>::derive_text(base_password, true, "channel");
     let url = signaling.join(&channel).unwrap();
 
-    let (signalling, dialer) = Websocket::new(url)
-        .await
-        .map_err(|e| ConnectError::Io(e.into()))?;
+    let (signalling, dialer) = Websocket::new(url).await.map_err(SignalingError::from)?;
     let agreement = Agreement::new(signalling, base_password.to_owned(), dialer);
     let (basekey, signalling) = agreement.agree().await?;
 
@@ -59,84 +58,101 @@ pub async fn connect(
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConnectError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Timeout(#[from] TimeoutError),
+    #[error(transparent)]
+    SignalingError(SignalingError),
+    #[error(transparent)]
+    AgreementError(AgreementError),
+    #[error(transparent)]
+    StreamError(StreamError),
+    #[error(transparent)]
+    SctpError(SctpError),
+    #[error(transparent)]
+    Chacha20Error(Chacha20Error),
     #[error("No default value available for signaling, must provide one")]
     NoDefaultValue(Constants),
     #[error(transparent)]
     BadSignalingUrl(url::ParseError),
     #[error(transparent)]
     BadIceUrl(webrtc_ice::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    AgreementError(AgreementError<<ConnectionSignaling as WaitThen>::Error>),
-    #[error(transparent)]
-    Chacha20Error(Chacha20Error<<ConnectionSctp as WaitThen>::Error>),
-    #[error(transparent)]
-    SctpError(SctpError<<ConnectionControl as WaitThen>::Error>),
-    #[error(transparent)]
-    IceError(IceError<<ConnectionSignaling as WaitThen>::Error>),
-    #[error(transparent)]
-    SignalingError(#[from] <ConnectionSignaling as WaitThen>::Error),
 }
-impl IntoIoError for ConnectError {
-    fn kind(&self) -> io::ErrorKind {
-        match self {
-            ConnectError::NoDefaultValue(_) => io::ErrorKind::InvalidInput,
-            ConnectError::BadSignalingUrl(_) => io::ErrorKind::InvalidInput,
-            ConnectError::BadIceUrl(_) => io::ErrorKind::InvalidInput,
-            ConnectError::Io(e) => e.kind(),
-            ConnectError::AgreementError(e) => e.kind(),
-            ConnectError::Chacha20Error(e) => e.kind(),
-            ConnectError::SctpError(e) => e.kind(),
-            ConnectError::IceError(e) => e.kind(),
-            ConnectError::SignalingError(e) => e.kind(),
+impl From<SignalingError> for ConnectError {
+    fn from(value: SignalingError) -> Self {
+        match value {
+            SignalingError::Io(e) => e.into(),
+            SignalingError::Timeout(e) => e.into(),
+            e @ SignalingError::ProtocolError(_) => Self::SignalingError(e),
         }
     }
 }
-impl From<ConnectError> for io::Error {
+impl From<AgreementError> for ConnectError {
+    fn from(value: AgreementError) -> Self {
+        match value {
+            AgreementError::Io(e) => e.into(),
+            AgreementError::Timeout(e) => e.into(),
+            AgreementError::SignalingError(e) => e.into(),
+            e @ AgreementError::Base64Error(_) => Self::AgreementError(e),
+            e @ AgreementError::CryptoError(_) => Self::AgreementError(e),
+            e @ AgreementError::TagMismatch => Self::AgreementError(e),
+        }
+    }
+}
+impl From<IceError> for ConnectError {
+    fn from(value: IceError) -> Self {
+        Self::StreamError(value.into())
+    }
+}
+impl From<StreamError> for ConnectError {
+    fn from(value: StreamError) -> Self {
+        match value {
+            StreamError::Io(e) => e.into(),
+            StreamError::Timeout(e) => e.into(),
+            StreamError::SignalingError(e) => e.into(),
+            e @ StreamError::Other(_) => Self::StreamError(e),
+        }
+    }
+}
+impl From<SctpError> for ConnectError {
+    fn from(value: SctpError) -> Self {
+        match value {
+            SctpError::Io(e) => e.into(),
+            SctpError::Timeout(e) => e.into(),
+            SctpError::SignalingError(e) => e.into(),
+            e @ SctpError::StreamError(_) => Self::SctpError(e),
+            e @ SctpError::AssociationClosedWithoutStream => Self::SctpError(e),
+            e @ SctpError::WebrtcSctpError(_) => Self::SctpError(e),
+        }
+    }
+}
+impl From<Chacha20Error> for ConnectError {
+    fn from(value: Chacha20Error) -> Self {
+        match value {
+            Chacha20Error::Io(e) => e.into(),
+            Chacha20Error::Timeout(e) => e.into(),
+            Chacha20Error::SignalingError(e) => e.into(),
+            Chacha20Error::StreamError(e) => e.into(),
+            e @ Chacha20Error::CryptoError(_) => Self::Chacha20Error(e),
+        }
+    }
+}
+pub type ConnectResult<T> = Result<T, ConnectError>;
+
+impl From<ConnectError> for StreamError {
     fn from(value: ConnectError) -> Self {
         match value {
-            ConnectError::Io(e) => e,
-            ConnectError::AgreementError(e) => e.into(),
-            ConnectError::Chacha20Error(e) => e.into(),
-            ConnectError::SctpError(e) => e.into(),
-            ConnectError::IceError(e) => e.into(),
+            ConnectError::Io(e) => e.into(),
+            ConnectError::Timeout(e) => e.into(),
             ConnectError::SignalingError(e) => e.into(),
-            e => io::Error::new(e.kind(), e),
-        }
-    }
-}
-
-pub type ConnectResult<T> = Result<T, ConnectError>;
-impl From<AgreementError<<ConnectionSignaling as WaitThen>::Error>> for ConnectError {
-    fn from(value: AgreementError<<ConnectionSignaling as WaitThen>::Error>) -> Self {
-        match value {
-            AgreementError::SignalingError(e) => e.into(),
-            e => ConnectError::AgreementError(e),
-        }
-    }
-}
-impl From<Chacha20Error<<ConnectionSctp as WaitThen>::Error>> for ConnectError {
-    fn from(value: <Connection as WaitThen>::Error) -> Self {
-        match value {
-            Chacha20Error::StreamError(e) => e.into(),
-            e => ConnectError::Chacha20Error(e),
-        }
-    }
-}
-impl From<SctpError<<ConnectionControl as WaitThen>::Error>> for ConnectError {
-    fn from(value: SctpError<<ConnectionControl as WaitThen>::Error>) -> Self {
-        match value {
-            SctpError::ControlError(e) => e.into(),
-            e => ConnectError::SctpError(e),
-        }
-    }
-}
-impl From<IceError<<ConnectionSignaling as WaitThen>::Error>> for ConnectError {
-    fn from(value: IceError<<ConnectionSignaling as WaitThen>::Error>) -> Self {
-        match value {
-            IceError::SignalingError(e) => e.into(),
-            e => ConnectError::IceError(e),
+            e @ ConnectError::AgreementError(_) => Self::Other(Box::new(e)),
+            ConnectError::StreamError(e) => e,
+            ConnectError::SctpError(e) => e.into(),
+            ConnectError::Chacha20Error(e) => e.into(),
+            e @ ConnectError::NoDefaultValue(_) => StreamError::Other(Box::new(e)),
+            e @ ConnectError::BadSignalingUrl(_) => StreamError::Other(Box::new(e)),
+            e @ ConnectError::BadIceUrl(_) => StreamError::Other(Box::new(e)),
         }
     }
 }
