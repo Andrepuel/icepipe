@@ -1,21 +1,18 @@
 use crate::{
     error::TimeoutError,
+    ping::{MustPing, Ping},
     pipe_stream::WaitThen,
     signalling::{SignalingError, Signalling},
 };
 use futures::{future::LocalBoxFuture, FutureExt, SinkExt, StreamExt};
-use std::{
-    io,
-    time::{Duration, Instant},
-};
-use tokio::{net::TcpStream, select, time::sleep_until};
+use std::io;
+use tokio::{net::TcpStream, select};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 pub struct Websocket {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    last_ping: Instant,
-    last_pong: Instant,
+    ping: Ping,
 }
 unsafe impl Send for Websocket {}
 impl Websocket {
@@ -39,14 +36,10 @@ impl Websocket {
             }
         };
 
-        let last_ping = Instant::now();
-        let last_pong = Instant::now();
-
         Ok((
             Websocket {
                 ws,
-                last_ping,
-                last_pong,
+                ping: Default::default(),
             },
             dialer,
         ))
@@ -67,19 +60,14 @@ impl WaitThen for Websocket {
     type Error = WebsocketError;
 
     fn wait(&mut self) -> LocalBoxFuture<'_, WebsocketResult<Self::Value>> {
-        let next_ping = self.last_ping + Duration::from_secs(15);
-        let pong_timeout = self.last_pong + Duration::from_secs(60);
         async move {
             select! {
                 msg = self.ws.next() => {
                     let msg = msg.ok_or(TungsteniteError::ConnectionClosed)??;
                     Ok(WebsocketValue::Incoming(msg))
                 },
-                _ = sleep_until(next_ping.into()) => {
-                    Ok(WebsocketValue::Ping)
-                }
-                _ = sleep_until(pong_timeout.into()) => {
-                    Err(TimeoutError.into())
+                r = self.ping.wait() => {
+                    Ok(r?.into())
                 }
             }
         }
@@ -97,14 +85,12 @@ impl WaitThen for Websocket {
                     let candidate = match msg {
                         Message::Text(candidate) => candidate,
                         Message::Ping(a) => {
-                            self.last_ping = Instant::now();
-                            self.last_pong = Instant::now();
+                            self.ping.received_pong();
                             self.ws.send(Message::Pong(a)).await?;
                             return Ok(None);
                         }
                         Message::Pong(_) => {
-                            self.last_ping = Instant::now();
-                            self.last_pong = Instant::now();
+                            self.ping.received_pong();
                             return Ok(None);
                         }
                         x => {
@@ -116,8 +102,8 @@ impl WaitThen for Websocket {
 
                     Ok(Some(candidate))
                 }
-                WebsocketValue::Ping => {
-                    self.last_ping = Instant::now();
+                WebsocketValue::MustPing(_) => {
+                    self.ping.sent_ping();
                     self.ws.send(Message::Ping(vec![])).await?;
                     Ok(None)
                 }
@@ -126,9 +112,15 @@ impl WaitThen for Websocket {
         .boxed_local()
     }
 }
+
 pub enum WebsocketValue {
     Incoming(Message),
-    Ping,
+    MustPing(MustPing),
+}
+impl From<MustPing> for WebsocketValue {
+    fn from(value: MustPing) -> Self {
+        Self::MustPing(value)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

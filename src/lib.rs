@@ -5,6 +5,7 @@ pub mod constants;
 pub mod crypto_stream;
 pub mod error;
 pub mod ice;
+pub mod ping;
 pub mod pipe_stream;
 pub mod sctp;
 pub mod signalling;
