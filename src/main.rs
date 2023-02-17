@@ -3,7 +3,6 @@ use icepipe::{
     async_pipe_stream::{AsyncPipeStream, DynAsyncRead, DynAsyncWrite},
     pipe_stream::{Control, PipeStream, StreamResult, WaitThen},
 };
-use std::process;
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
@@ -123,5 +122,7 @@ async fn main2() -> StreamResult<()> {
     peer_stream.close().await?;
     local_stream.close().await?;
 
-    process::exit(0);
+    log::info!("ready to close");
+
+    Ok(())
 }

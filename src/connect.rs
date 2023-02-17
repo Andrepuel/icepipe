@@ -12,9 +12,7 @@ use crate::{
 use std::{io, str::FromStr};
 
 pub type Connection = Chacha20Stream<ConnectionSctp>;
-type ConnectionSctp = Sctp<ConnectionControl>;
-type ConnectionControl = IceAgent<ConnectionSignaling>;
-type ConnectionSignaling = Websocket;
+type ConnectionSctp = Sctp;
 
 pub async fn connect(
     channel: &str,
@@ -51,7 +49,7 @@ pub async fn connect(
 
     let mut agent = IceAgent::new(signalling, dialer, ice_urls).await?;
     let net_conn = agent.connect().await?;
-    let stream = Sctp::new(net_conn, dialer, agent).await?;
+    let stream = Sctp::new(net_conn, dialer, agent.connection()).await?;
 
     Ok(Chacha20Stream::new(&basekey, dialer, stream)?)
 }

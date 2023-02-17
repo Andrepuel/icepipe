@@ -8,32 +8,31 @@ use futures::{
     future::{ready, Either, LocalBoxFuture},
     FutureExt,
 };
-use std::{io, sync::Arc, time::Duration};
-use tokio::{select, time::sleep};
+use std::{
+    io,
+    ops::Deref,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{select, sync::watch, time::sleep};
+use webrtc_ice::state::ConnectionState;
 use webrtc_sctp::{
     association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier, stream::Stream,
 };
 use webrtc_util::Conn;
 
-pub struct Sctp<C>
-where
-    C: Control,
-    C::Error: Into<StreamError>,
-{
+pub struct Sctp {
     _association: Association,
     stream: Arc<Stream>,
     buf: Vec<u8>,
-    underlying: C,
+    connection: watch::Receiver<ConnectionState>,
+    rx_closed: bool,
 }
-impl<C> Sctp<C>
-where
-    C: Control,
-    C::Error: Into<StreamError>,
-{
+impl Sctp {
     pub async fn new(
         net_conn: Arc<dyn Conn + Send + Sync>,
         dialer: bool,
-        underlying: C,
+        connection: watch::Receiver<ConnectionState>,
     ) -> SctpResult<Self> {
         let config = webrtc_sctp::association::Config {
             net_conn,
@@ -47,7 +46,7 @@ where
             false => Association::server(config).await?,
         };
 
-        let stream = match dialer {
+        let stream_data = match dialer {
             true => {
                 association
                     .open_stream(1, PayloadProtocolIdentifier::Binary)
@@ -58,7 +57,8 @@ where
                 .await
                 .ok_or(SctpError::AssociationClosedWithoutStream)?,
         };
-        stream.write_sctp(
+
+        stream_data.write_sctp(
             &Bytes::from_static(b"\0"),
             PayloadProtocolIdentifier::StringEmpty,
         )?;
@@ -68,17 +68,27 @@ where
 
         Ok(Sctp {
             _association: association,
-            stream,
+            stream: stream_data,
             buf,
-            underlying,
+            connection,
+            rx_closed: false,
         })
     }
+
+    fn connection_closed(&self) -> bool {
+        match self.connection.borrow().deref() {
+            ConnectionState::Unspecified => false,
+            ConnectionState::New => false,
+            ConnectionState::Checking => false,
+            ConnectionState::Connected => false,
+            ConnectionState::Completed => true,
+            ConnectionState::Failed => true,
+            ConnectionState::Disconnected => true,
+            ConnectionState::Closed => true,
+        }
+    }
 }
-impl<C> PipeStream for Sctp<C>
-where
-    C: Control,
-    C::Error: Into<StreamError>,
-{
+impl PipeStream for Sctp {
     fn send<'a>(&'a mut self, data: &'a [u8]) -> LocalBoxFuture<'a, SctpResult<()>> {
         async move {
             self.stream
@@ -92,12 +102,8 @@ where
         .boxed_local()
     }
 }
-impl<C> WaitThen for Sctp<C>
-where
-    C: Control,
-    C::Error: Into<StreamError>,
-{
-    type Value = Either<C::Value, (usize, PayloadProtocolIdentifier)>;
+impl WaitThen for Sctp {
+    type Value = Either<ConnectionState, (usize, PayloadProtocolIdentifier)>;
     type Output = Option<Vec<u8>>;
     type Error = SctpError;
 
@@ -106,8 +112,9 @@ where
 
         Box::pin(async move {
             let r = select! {
-                value = self.underlying.wait() => {
-                    Either::Left(value.map_err(Into::into)?)
+                r = self.connection.changed() => {
+                    r.unwrap();
+                    Either::Left(*self.connection.borrow())
                 },
                 r = self.stream.read_sctp(&mut self.buf[..]) => {
                     let (n, protocol_id) = r?;
@@ -123,14 +130,13 @@ where
         value: &'a mut Self::Value,
     ) -> LocalBoxFuture<'a, SctpResult<Self::Output>> {
         match value {
-            Either::Left(x) => {
-                let r = self.underlying.then(x);
-                Box::pin(async move {
-                    r.await.map_err(Into::into)?;
-                    Ok(None)
-                })
-            }
+            Either::Left(_x) => Box::pin(async move { Ok(None) }),
             Either::Right((n, protocol_id)) => {
+                if *n == 0 {
+                    self.rx_closed = true;
+                    return ready(Ok(None)).boxed_local();
+                }
+
                 if *protocol_id != PayloadProtocolIdentifier::Binary {
                     return ready(Ok(None)).boxed_local();
                 }
@@ -141,19 +147,15 @@ where
         }
     }
 }
-impl<C> Control for Sctp<C>
-where
-    C: Control,
-    C::Error: Into<StreamError>,
-{
+impl Control for Sctp {
     fn close(&mut self) -> LocalBoxFuture<'_, SctpResult<()>> {
         async move {
-            while self.stream.buffered_amount() > 0 {
+            let max_wait = Instant::now() + Duration::from_secs(5);
+            while self.stream.buffered_amount() > 0 && Instant::now() < max_wait {
                 sleep(Duration::from_millis(100)).await;
             }
             sleep(Duration::from_millis(100)).await;
 
-            self.underlying.close().await.map_err(Into::into)?;
             self.stream.shutdown(std::net::Shutdown::Both).await?;
 
             Ok(())
@@ -162,7 +164,7 @@ where
     }
 
     fn rx_closed(&self) -> bool {
-        self.underlying.rx_closed()
+        self.rx_closed || self.connection_closed()
     }
 }
 

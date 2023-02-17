@@ -5,13 +5,17 @@ use crate::{
 };
 use futures::{
     future::{Either, LocalBoxFuture},
-    pin_mut,
+    pin_mut, FutureExt,
 };
 use std::{io, sync::Arc};
-use tokio::{select, sync::mpsc};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+};
 use webrtc_ice::{
     agent::{agent_config::AgentConfig, Agent},
     candidate::{candidate_base::unmarshal_candidate, Candidate},
+    state::ConnectionState,
     url::Url,
 };
 use webrtc_util::Conn;
@@ -145,6 +149,7 @@ where
     agent: Agent,
     exchange: CandidateExchange<S>,
     dialer: bool,
+    connection: watch::Receiver<ConnectionState>,
 }
 impl<S> IceAgent<S>
 where
@@ -175,12 +180,20 @@ where
             })
         }));
 
+        let (connection_send, connection) = watch::channel(Default::default());
+        agent.on_connection_state_change(Box::new(move |state| {
+            let _ = connection_send.send(state);
+
+            std::future::ready(()).boxed()
+        }));
+
         agent.gather_candidates()?;
 
         Ok(IceAgent {
             agent,
             exchange,
             dialer,
+            connection,
         })
     }
 
@@ -241,6 +254,10 @@ where
         log::info!("ICE connected");
 
         Ok(net_conn)
+    }
+
+    pub fn connection(&self) -> watch::Receiver<ConnectionState> {
+        self.connection.clone()
     }
 }
 impl<S> WaitThen for IceAgent<S>
