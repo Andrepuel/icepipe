@@ -239,15 +239,21 @@ where
         }
 
         let conn_ing = do_connect(&self.agent, self.dialer);
+        let connection_error = Self::fetch_connection_error(self.connection());
         pin_mut!(conn_ing);
+        pin_mut!(connection_error);
         let net_conn = loop {
             let conn_ing = &mut conn_ing;
+            let connection_error = &mut connection_error;
             select! {
                 conn = conn_ing => {
                     break conn?;
                 },
                 value = Self::wait2(&mut self.exchange) => {
                     Self::then2(&self.agent, &mut self.exchange, &mut value?).await?;
+                }
+                r = connection_error => {
+                    r?;
                 }
             }
         };
@@ -258,6 +264,21 @@ where
 
     pub fn connection(&self) -> watch::Receiver<ConnectionState> {
         self.connection.clone()
+    }
+
+    async fn fetch_connection_error(
+        mut connection: watch::Receiver<ConnectionState>,
+    ) -> Result<(), TimeoutError> {
+        loop {
+            match *connection.borrow() {
+                ConnectionState::Failed => return Err(TimeoutError),
+                ConnectionState::Disconnected => return Err(TimeoutError),
+                ConnectionState::Closed => return Err(TimeoutError),
+                _ => (),
+            };
+
+            connection.changed().await.unwrap();
+        }
     }
 }
 impl<S> WaitThen for IceAgent<S>
