@@ -1,5 +1,5 @@
 use crate::{
-    agreement::{Agreement, AgreementError},
+    agreement::{Agreement, AgreementError, PskAuthentication},
     constants,
     crypto_stream::{Chacha20Error, Chacha20Stream},
     error::TimeoutError,
@@ -40,11 +40,12 @@ pub async fn connect(
         .collect::<ConnectResult<_>>()?;
 
     let base_password = channel;
-    let channel = Agreement::<Websocket>::derive_text(base_password, true, "channel");
+    let channel = PskAuthentication::derive_text(base_password, true, "channel");
     let url = signaling.join(&channel).unwrap();
 
     let (signalling, dialer) = Websocket::new(url).await.map_err(SignalingError::from)?;
-    let agreement = Agreement::new(signalling, base_password.to_owned(), dialer);
+    let auth = PskAuthentication::new(base_password.to_owned(), dialer);
+    let agreement = Agreement::new(signalling, auth);
     let (basekey, signalling) = agreement.agree().await?;
 
     let mut agent = IceAgent::new(signalling, dialer, ice_urls).await?;
@@ -94,7 +95,7 @@ impl From<AgreementError> for ConnectError {
             AgreementError::SignalingError(e) => e.into(),
             e @ AgreementError::Base64Error(_) => Self::AgreementError(e),
             e @ AgreementError::CryptoError(_) => Self::AgreementError(e),
-            e @ AgreementError::TagMismatch => Self::AgreementError(e),
+            e @ AgreementError::BadAuth(..) => Self::AgreementError(e),
         }
     }
 }

@@ -6,23 +6,120 @@ use base64::{
     prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD},
     Engine,
 };
-use ring::{agreement, hmac, pbkdf2, rand::SystemRandom};
+use ring::{
+    agreement, hmac, pbkdf2,
+    rand::SystemRandom,
+    signature::{self, VerificationAlgorithm},
+};
 use std::{io, num::NonZeroU32};
 
-pub struct Agreement<T>
+pub struct Agreement<T, A>
 where
     T: Signalling,
     T::Error: Into<SignalingError>,
+    A: Authentication,
 {
     signalling: T,
+    auth: A,
+}
+impl<T, A> Agreement<T, A>
+where
+    T: Signalling,
+    T::Error: Into<SignalingError>,
+    A: Authentication,
+{
+    pub fn new(signalling: T, auth: A) -> Agreement<T, A> {
+        Self { signalling, auth }
+    }
+
+    pub async fn agree(mut self) -> AgreementResult<(Vec<u8>, T)> {
+        let rng = SystemRandom::new();
+        let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)?;
+        let my_public_key = my_private_key.compute_public_key()?;
+
+        self.signalling
+            .send(BASE64_STANDARD.encode(&my_public_key))
+            .await
+            .map_err(Into::into)?;
+
+        self.signalling
+            .send(BASE64_STANDARD.encode(self.auth.sign(my_public_key.as_ref())))
+            .await
+            .map_err(Into::into)?;
+
+        let peer_public_key = self.signalling_recv().await?;
+        let peer_public_key = BASE64_STANDARD.decode(&peer_public_key)?;
+        let peer_public_key_signature = self.signalling_recv().await?;
+        let peer_public_key_signature = BASE64_STANDARD.decode(peer_public_key_signature)?;
+        self.auth
+            .check_peer(&peer_public_key, &peer_public_key_signature)
+            .map_err(|e| AgreementError::BadAuth(Box::new(e)))?;
+        let peer_public_key =
+            agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public_key);
+
+        let key_material = agreement::agree_ephemeral(
+            my_private_key,
+            &peer_public_key,
+            ring::error::Unspecified,
+            |key_material| Ok(key_material.to_owned()),
+        )?;
+
+        Ok((key_material, self.signalling))
+    }
+
+    async fn signalling_recv(&mut self) -> AgreementResult<String> {
+        loop {
+            let mut value = self.signalling.wait().await.map_err(Into::into)?;
+            let then = self.signalling.then(&mut value).await.map_err(Into::into)?;
+            match then {
+                Some(key) => break Ok(key),
+                None => continue,
+            }
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AgreementError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Timeout(#[from] TimeoutError),
+    #[error(transparent)]
+    SignalingError(SignalingError),
+    #[error(transparent)]
+    Base64Error(#[from] base64::DecodeError),
+    #[error("Crypto error")]
+    CryptoError(ring::error::Unspecified),
+    #[error("Mismatch authentication tag on key agreement based on PSK, {0}")]
+    BadAuth(Box<AgreementError>),
+}
+impl From<SignalingError> for AgreementError {
+    fn from(value: SignalingError) -> Self {
+        match value {
+            SignalingError::Timeout(e) => e.into(),
+            SignalingError::Io(e) => e.into(),
+            e => Self::SignalingError(e),
+        }
+    }
+}
+impl From<ring::error::Unspecified> for AgreementError {
+    fn from(value: ring::error::Unspecified) -> Self {
+        Self::CryptoError(value)
+    }
+}
+pub type AgreementResult<T> = Result<T, AgreementError>;
+
+pub trait Authentication {
+    fn sign(&self, data: &[u8]) -> Vec<u8>;
+    fn check_peer(&self, data: &[u8], signature: &[u8]) -> AgreementResult<()>;
+}
+
+pub struct PskAuthentication {
     psk: String,
     dialer: bool,
 }
-impl<T> Agreement<T>
-where
-    T: Signalling,
-    T::Error: Into<SignalingError>,
-{
+impl PskAuthentication {
     pub fn derive(basekey: &str, dialer: bool, salt: &str, out: &mut [u8]) {
         let salt = format!(
             "{}:{}",
@@ -51,98 +148,50 @@ where
         BASE64_URL_SAFE_NO_PAD.encode(Self::derive_len(basekey, dialer, salt, 32))
     }
 
-    pub fn new(signalling: T, psk: String, dialer: bool) -> Agreement<T> {
-        Self {
-            signalling,
-            psk,
-            dialer,
-        }
+    pub fn new(psk: String, dialer: bool) -> PskAuthentication {
+        PskAuthentication { psk, dialer }
     }
 
-    pub async fn agree(mut self) -> AgreementResult<(Vec<u8>, T)> {
-        let rng = SystemRandom::new();
-        let my_private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)?;
-        let my_public_key = my_private_key.compute_public_key()?;
+    fn key(&self, purpose: HmacKeyPurpose) -> hmac::Key {
+        let dialer = match purpose {
+            HmacKeyPurpose::Signing => self.dialer,
+            HmacKeyPurpose::Verifying => !self.dialer,
+        };
 
-        self.signalling
-            .send(BASE64_STANDARD.encode(&my_public_key))
-            .await
-            .map_err(Into::into)?;
-        let peer_public_key = self.signalling_recv().await?;
-        let peer_public_key = agreement::UnparsedPublicKey::new(
-            &agreement::X25519,
-            BASE64_STANDARD.decode(&peer_public_key)?,
-        );
-
-        let key_material = agreement::agree_ephemeral(
-            my_private_key,
-            &peer_public_key,
-            ring::error::Unspecified,
-            |key_material| Ok(key_material.to_owned()),
-        )?;
-
-        let auth_tx = self.key_material_check_tag(&key_material, self.dialer);
-        let auth_rx = self.key_material_check_tag(&key_material, !self.dialer);
-
-        self.signalling
-            .send(BASE64_STANDARD.encode(auth_tx))
-            .await
-            .map_err(Into::into)?;
-        let auth_rx_rx = self.signalling_recv().await?;
-        if auth_rx.as_ref() != BASE64_STANDARD.decode(auth_rx_rx)? {
-            return Err(AgreementError::TagMismatch);
-        }
-
-        Ok((key_material, self.signalling))
-    }
-
-    fn key_material_check_tag(&self, key_material: &[u8], dialer: bool) -> hmac::Tag {
-        let key = hmac::Key::new(
+        hmac::Key::new(
             hmac::HMAC_SHA512,
             &Self::derive_len(&self.psk, dialer, "keymaterial_check", 32),
-        );
-        hmac::sign(&key, key_material)
+        )
+    }
+}
+impl Authentication for PskAuthentication {
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        hmac::sign(&self.key(HmacKeyPurpose::Signing), data)
+            .as_ref()
+            .to_owned()
     }
 
-    async fn signalling_recv(&mut self) -> AgreementResult<String> {
-        loop {
-            let mut value = self.signalling.wait().await.map_err(Into::into)?;
-            let then = self.signalling.then(&mut value).await.map_err(Into::into)?;
-            match then {
-                Some(key) => break Ok(key),
-                None => continue,
-            }
-        }
+    fn check_peer(&self, data: &[u8], signature: &[u8]) -> AgreementResult<()> {
+        Ok(hmac::verify(
+            &self.key(HmacKeyPurpose::Verifying),
+            data,
+            signature,
+        )?)
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum AgreementError {
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Timeout(#[from] TimeoutError),
-    #[error(transparent)]
-    SignalingError(SignalingError),
-    #[error(transparent)]
-    Base64Error(#[from] base64::DecodeError),
-    #[error("Crypto error")]
-    CryptoError(ring::error::Unspecified),
-    #[error("Mismatch authentication tag on key agreement based on PSK")]
-    TagMismatch,
+enum HmacKeyPurpose {
+    Signing,
+    Verifying,
 }
-impl From<SignalingError> for AgreementError {
-    fn from(value: SignalingError) -> Self {
-        match value {
-            SignalingError::Timeout(e) => e.into(),
-            SignalingError::Io(e) => e.into(),
-            e => Self::SignalingError(e),
-        }
+
+struct Ed25519PairAndPeer(signature::Ed25519KeyPair, Vec<u8>);
+impl Authentication for Ed25519PairAndPeer {
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        self.0.sign(data).as_ref().to_owned()
+    }
+
+    fn check_peer(&self, data: &[u8], signature: &[u8]) -> AgreementResult<()> {
+        Ok(signature::ED25519.verify(self.1.as_slice().into(), data.into(), signature.into())?)
     }
 }
-impl From<ring::error::Unspecified> for AgreementError {
-    fn from(value: ring::error::Unspecified) -> Self {
-        Self::CryptoError(value)
-    }
-}
-pub type AgreementResult<T> = Result<T, AgreementError>;
