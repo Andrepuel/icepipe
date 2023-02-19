@@ -117,18 +117,9 @@ pub trait Authentication {
 
 pub struct PskAuthentication {
     psk: String,
-    dialer: bool,
 }
 impl PskAuthentication {
-    pub fn derive(basekey: &str, dialer: bool, salt: &str, out: &mut [u8]) {
-        let salt = format!(
-            "{}:{}",
-            match dialer {
-                true => "dialer",
-                false => "listener",
-            },
-            salt
-        );
+    pub fn derive(basekey: &str, salt: &str, out: &mut [u8]) {
         pbkdf2::derive(
             pbkdf2::PBKDF2_HMAC_SHA512,
             NonZeroU32::new(4096).unwrap(),
@@ -138,54 +129,38 @@ impl PskAuthentication {
         );
     }
 
-    pub fn derive_len(basekey: &str, dialer: bool, salt: &str, len: usize) -> Vec<u8> {
+    pub fn derive_len(basekey: &str, salt: &str, len: usize) -> Vec<u8> {
         let mut data = vec![0; len];
-        Self::derive(basekey, dialer, salt, &mut data);
+        Self::derive(basekey, salt, &mut data);
         data
     }
 
-    pub fn derive_text(basekey: &str, dialer: bool, salt: &str) -> String {
-        BASE64_URL_SAFE_NO_PAD.encode(Self::derive_len(basekey, dialer, salt, 32))
+    pub fn derive_text(basekey: &str, salt: &str) -> String {
+        BASE64_URL_SAFE_NO_PAD.encode(Self::derive_len(basekey, salt, 32))
     }
 
-    pub fn new(psk: String, dialer: bool) -> PskAuthentication {
-        PskAuthentication { psk, dialer }
+    pub fn new(psk: String) -> PskAuthentication {
+        PskAuthentication { psk }
     }
 
-    fn key(&self, purpose: HmacKeyPurpose) -> hmac::Key {
-        let dialer = match purpose {
-            HmacKeyPurpose::Signing => self.dialer,
-            HmacKeyPurpose::Verifying => !self.dialer,
-        };
-
+    fn key(&self) -> hmac::Key {
         hmac::Key::new(
             hmac::HMAC_SHA512,
-            &Self::derive_len(&self.psk, dialer, "keymaterial_check", 32),
+            &Self::derive_len(&self.psk, "keymaterial_check", 32),
         )
     }
 }
 impl Authentication for PskAuthentication {
     fn sign(&self, data: &[u8]) -> Vec<u8> {
-        hmac::sign(&self.key(HmacKeyPurpose::Signing), data)
-            .as_ref()
-            .to_owned()
+        hmac::sign(&self.key(), data).as_ref().to_owned()
     }
 
     fn check_peer(&self, data: &[u8], signature: &[u8]) -> AgreementResult<()> {
-        Ok(hmac::verify(
-            &self.key(HmacKeyPurpose::Verifying),
-            data,
-            signature,
-        )?)
+        Ok(hmac::verify(&self.key(), data, signature)?)
     }
 }
 
-enum HmacKeyPurpose {
-    Signing,
-    Verifying,
-}
-
-struct Ed25519PairAndPeer(signature::Ed25519KeyPair, Vec<u8>);
+pub struct Ed25519PairAndPeer(pub signature::Ed25519KeyPair, pub Vec<u8>);
 impl Authentication for Ed25519PairAndPeer {
     fn sign(&self, data: &[u8]) -> Vec<u8> {
         self.0.sign(data).as_ref().to_owned()

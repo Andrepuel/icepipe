@@ -1,5 +1,5 @@
 use crate::{
-    agreement::{Agreement, AgreementError, PskAuthentication},
+    agreement::{Agreement, AgreementError, Authentication, PskAuthentication},
     constants,
     crypto_stream::{Chacha20Error, Chacha20Stream},
     error::TimeoutError,
@@ -14,45 +14,74 @@ use std::{io, str::FromStr};
 pub type Connection = Chacha20Stream<ConnectionSctp>;
 type ConnectionSctp = Sctp;
 
+pub struct ConnectOptions {
+    pub channel: String,
+    pub signaling: Option<url::Url>,
+    pub ice: Vec<String>,
+}
+impl ConnectOptions {
+    pub async fn connect_psk(self) -> Result<Connection, ConnectError> {
+        let psk = self.channel.to_owned();
+        self.connect(PskAuthentication::new(psk)).await
+    }
+
+    pub async fn connect<A: Authentication>(self, auth: A) -> Result<Connection, ConnectError> {
+        let signaling = self.signaling.map(ConnectResult::Ok).unwrap_or_else(|| {
+            let default_signaling = constants::signalling_server()
+                .ok_or_else(|| ConnectError::NoDefaultValue(Constants::Signaling))?;
+
+            default_signaling
+                .parse()
+                .map_err(ConnectError::BadSignalingUrl)
+        })?;
+
+        let ice_urls = self
+            .ice
+            .into_option()
+            .or_else(|| constants::ice_urls().into_option())
+            .ok_or(ConnectError::NoDefaultValue(Constants::Ice))?;
+        let ice_urls = ice_urls
+            .into_iter()
+            .map(|s| {
+                ParseUrl::from_str(&s)
+                    .map(|u| u.0)
+                    .map_err(ConnectError::BadIceUrl)
+            })
+            .collect::<ConnectResult<_>>()?;
+
+        let base_password = self.channel;
+        let channel = PskAuthentication::derive_text(&base_password, "channel");
+        let url = signaling.join(&channel).unwrap();
+
+        let (signalling, dialer) = Websocket::new(url).await.map_err(SignalingError::from)?;
+        let agreement = Agreement::new(signalling, auth);
+        let (basekey, signalling) = agreement.agree().await?;
+
+        let mut agent = IceAgent::new(signalling, dialer, ice_urls).await?;
+        let net_conn = agent.connect().await?;
+        let stream = Sctp::new(net_conn, dialer, agent.connection()).await?;
+
+        Ok(Chacha20Stream::new(&basekey, dialer, stream)?)
+    }
+}
+
 pub async fn connect(
     channel: &str,
     signaling: Option<&str>,
     ice: &[String],
 ) -> Result<Connection, ConnectError> {
     let signaling = signaling
-        .map(ToOwned::to_owned)
-        .or_else(constants::signalling_server)
-        .ok_or(ConnectError::NoDefaultValue(Constants::Signaling))?;
-    let signaling = url::Url::parse(&signaling).map_err(ConnectError::BadSignalingUrl)?;
+        .map(url::Url::parse)
+        .transpose()
+        .map_err(ConnectError::BadSignalingUrl)?;
 
-    let ice_urls = ice
-        .to_owned()
-        .into_option()
-        .or_else(|| constants::ice_urls().into_option())
-        .ok_or(ConnectError::NoDefaultValue(Constants::Ice))?;
-    let ice_urls = ice_urls
-        .into_iter()
-        .map(|s| {
-            ParseUrl::from_str(&s)
-                .map(|u| u.0)
-                .map_err(ConnectError::BadIceUrl)
-        })
-        .collect::<ConnectResult<_>>()?;
-
-    let base_password = channel;
-    let channel = PskAuthentication::derive_text(base_password, true, "channel");
-    let url = signaling.join(&channel).unwrap();
-
-    let (signalling, dialer) = Websocket::new(url).await.map_err(SignalingError::from)?;
-    let auth = PskAuthentication::new(base_password.to_owned(), dialer);
-    let agreement = Agreement::new(signalling, auth);
-    let (basekey, signalling) = agreement.agree().await?;
-
-    let mut agent = IceAgent::new(signalling, dialer, ice_urls).await?;
-    let net_conn = agent.connect().await?;
-    let stream = Sctp::new(net_conn, dialer, agent.connection()).await?;
-
-    Ok(Chacha20Stream::new(&basekey, dialer, stream)?)
+    ConnectOptions {
+        channel: channel.to_owned(),
+        signaling,
+        ice: ice.to_owned(),
+    }
+    .connect_psk()
+    .await
 }
 
 #[derive(thiserror::Error, Debug)]

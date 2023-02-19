@@ -1,8 +1,11 @@
 use clap::Parser;
 use icepipe::{
+    agreement::Ed25519PairAndPeer,
     async_pipe_stream::{AsyncPipeStream, DynAsyncRead, DynAsyncWrite},
-    pipe_stream::{Control, PipeStream, StreamResult, WaitThen},
+    curve25519_conversion,
+    pipe_stream::{Control, PipeStream, StreamError, StreamResult, WaitThen},
 };
+use ring::signature::{self, KeyPair};
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
@@ -21,7 +24,16 @@ fn main() -> StreamResult<()> {
 #[derive(Parser)]
 struct Args {
     /// Channel to connect to, both side must pass the same value to establish a connection
+    /// If private key is provided, channel is assumed to be the peer public key.
     channel: String,
+
+    /// Private key for DH mode. Channel will be assumed to be peers public key.
+    #[clap(long = "private-key")]
+    private_key: Option<String>,
+
+    /// Generates a new key pair and closes the prorgam
+    #[clap(long = "gen-key")]
+    gen_key: bool,
 
     /// Specify a different signalling server URL
     #[clap(long = "signaling")]
@@ -51,8 +63,42 @@ struct Args {
 async fn main2() -> StreamResult<()> {
     let args = Args::parse();
 
-    let mut peer_stream =
-        icepipe::connect(&args.channel, args.signaling.as_deref(), &args.ice).await?;
+    if args.gen_key {
+        return gen_key()
+            .map_err(icepipe::agreement::AgreementError::from)
+            .map_err(|e| StreamError::Other(Box::new(e)));
+    }
+
+    let options = icepipe::ConnectOptions {
+        channel: args.channel,
+        signaling: args
+            .signaling
+            .map(|url| url.parse().map_err(|e| StreamError::Other(Box::new(e))))
+            .transpose()?,
+        ice: args.ice,
+    };
+
+    let mut peer_stream = match args.private_key {
+        Some(private_key) => {
+            let (key_pair, peer, x_key_pair, x_peer) = get_keys(private_key, options.channel)
+                .map_err(icepipe::agreement::AgreementError::from)
+                .map_err(|e| StreamError::Other(Box::new(e)))?;
+
+            let channel = x_key_pair
+                .diffie_hellman(&x_peer)
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+
+            let options = icepipe::ConnectOptions { channel, ..options };
+
+            let auth = Ed25519PairAndPeer(key_pair, peer);
+
+            options.connect(auth).await?
+        }
+        None => options.connect_psk().await?,
+    };
 
     let input: DynAsyncRead;
     let output: DynAsyncWrite;
@@ -125,4 +171,51 @@ async fn main2() -> StreamResult<()> {
     log::info!("ready to close");
 
     Ok(())
+}
+
+fn gen_key() -> Result<(), ring::error::Unspecified> {
+    let seed: [u8; 32] = ring::rand::generate(&ring::rand::SystemRandom::new())?.expose();
+    let key = signature::Ed25519KeyPair::from_seed_unchecked(&seed)?;
+    let private_key = seed.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let public_key = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    println!("--private-key {private_key}");
+    println!("Public key: {public_key}");
+
+    Ok(())
+}
+
+fn get_keys(
+    private_key: String,
+    peer: String,
+) -> Result<
+    (
+        signature::Ed25519KeyPair,
+        Vec<u8>,
+        x25519_dalek::StaticSecret,
+        x25519_dalek::PublicKey,
+    ),
+    ring::error::Unspecified,
+> {
+    let seed = (0..private_key.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&private_key[i..][..2], 16).unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    let peer = (0..peer.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&peer[i..][..2], 16).unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    let private_key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)?;
+
+    let x25519 = curve25519_conversion::ed25519_seed_to_x25519(&seed);
+    let x25519_peer = curve25519_conversion::ed25519_public_key_to_x25519(&peer)
+        .ok_or(ring::error::Unspecified)?;
+
+    Ok((private_key, peer, x25519, x25519_peer))
 }
