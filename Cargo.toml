@@ -1,6 +1,6 @@
 [package]
 name = "icepipe"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license-file = "LICENSE"
 description = "Peer to Peer communication encrypted using WebRTC"
@@ -13,9 +13,7 @@ keywords = ["socket", "sctp", "udp"]
 [dependencies]
 base64 = "0.21"
 bytes = "1.4"
-clap = { version = "4.1", features = ["derive"] }
 curve25519-dalek = { version = "3.2.1", default-features = false, features = ["u64_backend"]}
-env_logger = "0.10"
 futures = "0.3"
 log = "0.4"
 ring = "0.16.20"
@@ -29,3 +27,8 @@ webrtc-ice = "0.9"
 webrtc-sctp = "0.7"
 webrtc-util = "0.7"
 x25519-dalek = { version = "1.2.0", default-features = false }
+
+[workspace]
+members = [
+    "icepipe-cat"
+]

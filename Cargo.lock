@@ -415,13 +415,11 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 
 [[package]]
 name = "icepipe"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "base64 0.21.0",
  "bytes",
- "clap",
  "curve25519-dalek",
- "env_logger",
  "futures",
  "log",
  "ring",
@@ -433,6 +431,17 @@ dependencies = [
  "webrtc-sctp",
  "webrtc-util",
  "x25519-dalek",
+]
+
+[[package]]
+name = "icepipe-cat"
+version = "0.5.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "icepipe",
+ "log",
+ "tokio",
 ]
 
 [[package]]

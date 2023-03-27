@@ -4,8 +4,8 @@ use icepipe::{
     async_pipe_stream::{AsyncPipeStream, DynAsyncRead, DynAsyncWrite},
     curve25519_conversion,
     pipe_stream::{Control, PipeStream, StreamError, StreamResult, WaitThen},
+    ring::signature::{self, KeyPair},
 };
-use ring::signature::{self, KeyPair};
 use tokio::{
     net::{TcpListener, TcpStream},
     select,
@@ -173,8 +173,9 @@ async fn main2() -> StreamResult<()> {
     Ok(())
 }
 
-fn gen_key() -> Result<(), ring::error::Unspecified> {
-    let seed: [u8; 32] = ring::rand::generate(&ring::rand::SystemRandom::new())?.expose();
+fn gen_key() -> Result<(), icepipe::ring::error::Unspecified> {
+    let seed: [u8; 32] =
+        icepipe::ring::rand::generate(&icepipe::ring::rand::SystemRandom::new())?.expose();
     let key = signature::Ed25519KeyPair::from_seed_unchecked(&seed)?;
     let private_key = seed.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let public_key = key
@@ -196,10 +197,10 @@ fn get_keys(
     (
         signature::Ed25519KeyPair,
         Vec<u8>,
-        x25519_dalek::StaticSecret,
-        x25519_dalek::PublicKey,
+        icepipe::x25519_dalek::StaticSecret,
+        icepipe::x25519_dalek::PublicKey,
     ),
-    ring::error::Unspecified,
+    icepipe::ring::error::Unspecified,
 > {
     let seed = (0..private_key.len())
         .step_by(2)
@@ -211,11 +212,11 @@ fn get_keys(
         .map(|i| u8::from_str_radix(&peer[i..][..2], 16).unwrap_or_default())
         .collect::<Vec<_>>();
 
-    let private_key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)?;
+    let private_key = icepipe::ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)?;
 
     let x25519 = curve25519_conversion::ed25519_seed_to_x25519(&seed);
     let x25519_peer = curve25519_conversion::ed25519_public_key_to_x25519(&peer)
-        .ok_or(ring::error::Unspecified)?;
+        .ok_or(icepipe::ring::error::Unspecified)?;
 
     Ok((private_key, peer, x25519, x25519_peer))
 }

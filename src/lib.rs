@@ -13,3 +13,5 @@ pub mod signalling;
 pub mod ws;
 
 pub use connect::{connect, ConnectOptions};
+pub use ring;
+pub use x25519_dalek;

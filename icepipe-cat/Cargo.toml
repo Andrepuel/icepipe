@@ -1,0 +1,16 @@
+[package]
+name = "icepipe-cat"
+version = "0.5.0"
+edition = "2021"
+license-file = "LICENSE"
+description = "Peer to Peer communication encrypted using WebRTC"
+repository = "https://github.com/Andrepuel/icepipe"
+categories = ["cryptography", "network-programming"]
+keywords = ["socket", "sctp", "udp"]
+
+[dependencies]
+clap = { version = "4.1", features = ["derive"] }
+env_logger = "0.10"
+icepipe = { version = "0.5.0", path = "../" }
+log = "0.4"
+tokio = "1.25"
