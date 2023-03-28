@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 
 // Remarks: Making it easy to edit the binary executable
 
@@ -18,7 +18,7 @@ pub fn ice_urls() -> Vec<String> {
 fn bytes_to_str(env: &str, bytes: &'static [u8]) -> Option<String> {
     std::env::var(env).map_or_else(
         |_| {
-            let fallback = unsafe { CStr::from_ptr(bytes.as_ptr() as *const i8) };
+            let fallback = unsafe { CStr::from_ptr(bytes.as_ptr() as *const c_char) };
             let fallback = fallback.to_str().unwrap();
             let fallback = match fallback.split_once("__") {
                 Some((_, url)) => url,
